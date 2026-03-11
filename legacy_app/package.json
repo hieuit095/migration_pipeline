@@ -1,0 +1,9 @@
+{
+  "name": "legacy-app",
+  "version": "1.0.0",
+  "description": "Sample legacy service for blueprint generation",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

@@ -1,0 +1,16 @@
+2026-03-11T03:28:05.678529Z  INFO migration_pipeline: Starting AI-Powered Legacy Code Migration Pipeline
+2026-03-11T03:28:05.680213Z  INFO migration_pipeline: Initialized phase-1 blueprinter pipeline agent="blueprinter" provider="openrouter" model="google/gemini-3-flash-preview" file_io="file_io"
+2026-03-11T03:28:05.680289Z  INFO migration_pipeline: Initialized phase-2 executor pipeline agent="executor" provider="openrouter" model="minimax/minimax-m2.5" file_io="file_io" file_write="file_write" output_root="./modern_app"
+2026-03-11T03:28:05.680349Z  INFO migration_pipeline: Initialized phase-3 verifier pipeline agent="verifier" provider="openrouter" model="z-ai/glm-5" file_io="file_io" file_write="file_write" terminal="terminal"
+2026-03-11T03:28:05.680406Z  INFO migration_pipeline: Initialized phase-4 surgeon pipeline agent="surgeon" provider="openrouter" model="anthropic/claude-3.5-sonnet" file_io="file_io" file_write="file_write"
+2026-03-11T03:28:05.681405Z  INFO migration_pipeline::agents::blueprinter: Collected legacy codebase snapshot legacy_dir_path="./legacy_app" bytes=1590
+2026-03-11T03:28:24.620921Z  INFO migration_pipeline: Starting AI-Powered Legacy Code Migration Pipeline
+2026-03-11T03:28:24.622368Z  INFO migration_pipeline: Initialized phase-1 blueprinter pipeline agent="blueprinter" provider="openrouter" model="google/gemini-3-flash-preview" file_io="file_io"
+2026-03-11T03:28:24.622455Z  INFO migration_pipeline: Initialized phase-2 executor pipeline agent="executor" provider="openrouter" model="minimax/minimax-m2.5" file_io="file_io" file_write="file_write" output_root="./modern_app"
+2026-03-11T03:28:24.622514Z  INFO migration_pipeline: Initialized phase-3 verifier pipeline agent="verifier" provider="openrouter" model="z-ai/glm-5" file_io="file_io" file_write="file_write" terminal="terminal"
+2026-03-11T03:28:24.622575Z  INFO migration_pipeline: Initialized phase-4 surgeon pipeline agent="surgeon" provider="openrouter" model="anthropic/claude-3.5-sonnet" file_io="file_io" file_write="file_write"
+2026-03-11T03:28:24.623159Z  INFO migration_pipeline: Loaded migration state from disk and skipping blueprinter state_file=".migration_state.json" ticket_count=1
+2026-03-11T03:28:24.623551Z  INFO migration_pipeline: Ticket completed verification loop ticket_id="STATE-RESUME-1" retries=0
+2026-03-11T03:28:24.623694Z  INFO migration_pipeline: Pipeline verified ticket ticket_id="STATE-RESUME-1"
+2026-03-11T03:28:24.626380Z  INFO migration_pipeline: State writer flushed final migration state state_file=".migration_state.json" ticket_count=1
+2026-03-11T03:28:24.626454Z  INFO migration_pipeline: Aggregated pipeline token usage llm_calls=2 prompt_tokens=120 completion_tokens=45 total_tokens=165 audit_log_directory="logs" state_file=".migration_state.json"
