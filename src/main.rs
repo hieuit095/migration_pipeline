@@ -1,11 +1,13 @@
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use dotenv::dotenv;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, error, info, warn};
 
 mod agents;
@@ -18,12 +20,13 @@ use agents::{
     Agent, BlueprinterAgent, ExecutorAgent, SurgeonAgent, Ticket, TicketStatus, TicketTokenUsage,
     VerifierAgent,
 };
-use config::{LlmGateway, LlmProvider, ModelRouter, TaskKind};
-use skills::{FileIOSkill, FileWriteSkill, SandboxSkill, Skill};
+use config::{DockerSandboxConfig, ModelRouter, TaskKind, ZeroClawClient};
+use skills::{ASTParsingSkill, FileIOSkill, FileWriteSkill, ShadowTestSkill, Skill};
 use utils::state::{load_state, save_state};
 
 const MAX_SURGERY_RETRIES: u8 = 3;
 const STATE_FILE: &str = ".migration_state.json";
+const STATE_FLUSH_INTERVAL_SECS: u64 = 3;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,78 +35,61 @@ async fn main() -> Result<()> {
 
     info!("Starting AI-Powered Legacy Code Migration Pipeline");
 
-    let legacy_root = PathBuf::from("./legacy_app");
-    let modern_root = PathBuf::from("./modern_app");
-    fs::create_dir_all(&modern_root)?;
+    let startup_root =
+        std::env::current_dir().context("failed to resolve startup working directory")?;
+    let legacy_root = resolve_project_root(&startup_root, Path::new("./legacy_app"), false)?;
+    let modern_root = resolve_project_root(&startup_root, Path::new("./modern_app"), true)?;
 
+    let ast_parsing_skill: Arc<dyn Skill> = Arc::new(ASTParsingSkill);
     let file_io_skill: Arc<dyn Skill> = Arc::new(FileIOSkill);
     let file_write_skill: Arc<dyn Skill> = Arc::new(FileWriteSkill);
-    let sandbox_skill: Arc<dyn Skill> = Arc::new(SandboxSkill);
+    let docker_sandbox_config = DockerSandboxConfig::from_env()?;
+    let shadow_test_skill: Arc<dyn Skill> = Arc::new(ShadowTestSkill::new(docker_sandbox_config));
+    let ast_parsing_name = ast_parsing_skill.name().to_owned();
     let file_io_name = file_io_skill.name().to_owned();
     let file_write_name = file_write_skill.name().to_owned();
-    let sandbox_name = sandbox_skill.name().to_owned();
-    let llm_gateway = LlmGateway::new()?;
-    let blueprinter_route = ModelRouter::from_env(
-        TaskKind::Blueprinter,
-        LlmProvider::OpenRouter,
-        BlueprinterAgent::default_model(),
-    )?;
-    let executor_route = ModelRouter::from_env(
-        TaskKind::Executor,
-        LlmProvider::OpenRouter,
-        ExecutorAgent::default_model(),
-    )?;
-    let verifier_route = ModelRouter::from_env(
-        TaskKind::Verifier,
-        LlmProvider::OpenRouter,
-        VerifierAgent::default_model(),
-    )?;
-    let surgeon_route = ModelRouter::from_env(
-        TaskKind::Surgeon,
-        LlmProvider::OpenRouter,
-        SurgeonAgent::default_model(),
-    )?;
-    let blueprinter = BlueprinterAgent::new(
-        Arc::clone(&file_io_skill),
-        llm_gateway.clone(),
-        blueprinter_route,
-    );
+    let shadow_test_name = shadow_test_skill.name().to_owned();
+    let task_configs = vec![
+        ModelRouter::from_env(TaskKind::Blueprinter, BlueprinterAgent::default_model())?,
+        ModelRouter::from_env(TaskKind::Executor, ExecutorAgent::default_model())?,
+        ModelRouter::from_env(TaskKind::Verifier, VerifierAgent::default_model())?,
+        ModelRouter::from_env(TaskKind::Surgeon, SurgeonAgent::default_model())?,
+    ];
+    let llm_client = Arc::new(ZeroClawClient::new(task_configs)?);
+    let blueprinter =
+        BlueprinterAgent::new(Arc::clone(&ast_parsing_skill), Arc::clone(&llm_client));
     let executor = Arc::new(ExecutorAgent::new(
         legacy_root.clone(),
         modern_root.clone(),
         Arc::clone(&file_io_skill),
         Arc::clone(&file_write_skill),
-        llm_gateway,
-        executor_route,
+        Arc::clone(&llm_client),
     ));
     let verifier = Arc::new(VerifierAgent::new(
         legacy_root.clone(),
         modern_root.clone(),
-        Arc::clone(&file_io_skill),
-        Arc::clone(&file_write_skill),
-        Arc::clone(&sandbox_skill),
-        LlmGateway::new()?,
-        verifier_route,
+        Arc::clone(&ast_parsing_skill),
+        Arc::clone(&shadow_test_skill),
+        Arc::clone(&llm_client),
     ));
     let surgeon = Arc::new(SurgeonAgent::new(
         legacy_root.clone(),
         modern_root.clone(),
         Arc::clone(&file_io_skill),
         Arc::clone(&file_write_skill),
-        LlmGateway::new()?,
-        surgeon_route,
+        Arc::clone(&llm_client),
     ));
 
     info!(
         agent = blueprinter.name(),
-        provider = blueprinter.provider().as_str(),
+        provider = blueprinter.provider(),
         model = blueprinter.model(),
-        file_io = file_io_name.as_str(),
+        ast_parsing = ast_parsing_name.as_str(),
         "Initialized phase-1 blueprinter pipeline"
     );
     info!(
         agent = executor.name(),
-        provider = executor.provider().as_str(),
+        provider = executor.provider(),
         model = executor.model(),
         file_io = file_io_name.as_str(),
         file_write = file_write_name.as_str(),
@@ -112,16 +98,16 @@ async fn main() -> Result<()> {
     );
     info!(
         agent = verifier.name(),
-        provider = verifier.provider().as_str(),
+        provider = verifier.provider(),
         model = verifier.model(),
-        file_io = file_io_name.as_str(),
-        file_write = file_write_name.as_str(),
-        sandbox = sandbox_name.as_str(),
-        "Initialized phase-3 verifier pipeline with Docker sandboxing"
+        ast_parsing = ast_parsing_name.as_str(),
+        shadow_test = shadow_test_name.as_str(),
+        output_root = modern_root.to_string_lossy().as_ref(),
+        "Initialized phase-3 verifier pipeline with shadow testing"
     );
     info!(
         agent = surgeon.name(),
-        provider = surgeon.provider().as_str(),
+        provider = surgeon.provider(),
         model = surgeon.model(),
         file_io = file_io_name.as_str(),
         file_write = file_write_name.as_str(),
@@ -164,17 +150,19 @@ async fn main() -> Result<()> {
     let mut join_set = JoinSet::new();
 
     for ticket in tickets {
+        let permit = Arc::clone(&concurrency_limit)
+            .acquire_owned()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to acquire executor semaphore permit: {error}")
+            })?;
         let executor = Arc::clone(&executor);
         let verifier = Arc::clone(&verifier);
         let surgeon = Arc::clone(&surgeon);
-        let concurrency_limit = Arc::clone(&concurrency_limit);
         let tx = tx.clone();
 
         join_set.spawn(async move {
-            let _permit = concurrency_limit
-                .acquire_owned()
-                .await
-                .expect("executor semaphore should remain available");
+            let _permit = permit;
             run_ticket_feedback_loop(ticket, executor, verifier, surgeon, tx).await
         });
     }
@@ -306,16 +294,49 @@ async fn publish_ticket_state(state_tx: &mpsc::Sender<Ticket>, ticket: &Ticket) 
 
 async fn run_state_writer(
     state_path: String,
+    tickets: Vec<Ticket>,
+    rx: mpsc::Receiver<Ticket>,
+) -> Result<Vec<Ticket>> {
+    run_state_writer_with_flush_interval(
+        state_path,
+        tickets,
+        rx,
+        Duration::from_secs(STATE_FLUSH_INTERVAL_SECS),
+    )
+    .await
+}
+
+async fn run_state_writer_with_flush_interval(
+    state_path: String,
     mut tickets: Vec<Ticket>,
     mut rx: mpsc::Receiver<Ticket>,
+    flush_interval: Duration,
 ) -> Result<Vec<Ticket>> {
-    while let Some(updated_ticket) = rx.recv().await {
-        upsert_ticket(&mut tickets, updated_ticket);
-        save_state(&state_path, &tickets)?;
-    }
+    let mut flush_timer = interval(flush_interval);
+    flush_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    flush_timer.tick().await;
+    let mut has_pending_updates = false;
 
-    save_state(&state_path, &tickets)?;
-    Ok(tickets)
+    loop {
+        tokio::select! {
+            maybe_updated_ticket = rx.recv() => {
+                match maybe_updated_ticket {
+                    Some(updated_ticket) => {
+                        upsert_ticket(&mut tickets, updated_ticket);
+                        has_pending_updates = true;
+                    }
+                    None => {
+                        save_state(&state_path, &tickets)?;
+                        return Ok(tickets);
+                    }
+                }
+            }
+            _ = flush_timer.tick(), if has_pending_updates => {
+                save_state(&state_path, &tickets)?;
+                has_pending_updates = false;
+            }
+        }
+    }
 }
 
 fn upsert_ticket(tickets: &mut Vec<Ticket>, updated_ticket: Ticket) {
@@ -347,4 +368,169 @@ fn summarize_token_usage(tickets: &[Ticket]) -> TicketTokenUsage {
                 .saturating_add(ticket.token_usage.total_tokens);
             totals
         })
+}
+
+fn resolve_project_root(
+    startup_root: &Path,
+    configured_path: &Path,
+    create_if_missing: bool,
+) -> Result<PathBuf> {
+    let absolute_path = if configured_path.is_absolute() {
+        configured_path.to_path_buf()
+    } else {
+        startup_root.join(configured_path)
+    };
+
+    if create_if_missing {
+        fs::create_dir_all(&absolute_path).with_context(|| {
+            format!(
+                "failed to create required project directory {}",
+                absolute_path.display()
+            )
+        })?;
+    }
+
+    ensure!(
+        absolute_path.exists(),
+        "required project directory does not exist: {}",
+        absolute_path.display()
+    );
+    ensure!(
+        absolute_path.is_dir(),
+        "required project path is not a directory: {}",
+        absolute_path.display()
+    );
+
+    Ok(absolute_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_project_root, run_state_writer_with_flush_interval};
+    use crate::agents::{Ticket, TicketStatus, TicketTokenUsage};
+    use crate::utils::state::load_state;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::sync::mpsc;
+
+    fn make_temp_state_path(prefix: &str) -> (PathBuf, PathBuf) {
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("{prefix}_{unique_id}"));
+        fs::create_dir_all(&root).expect("temp directory should be created");
+        let state_path = root.join(".migration_state.json");
+        (root, state_path)
+    }
+
+    fn sample_ticket(id: &str) -> Ticket {
+        Ticket {
+            id: id.to_owned(),
+            description: format!("Ticket {id}"),
+            context_files: vec!["src/server.js".to_owned()],
+            status: TicketStatus::InProgress,
+            legacy_code_snippet: "http.createServer(...)".to_owned(),
+            target_framework: "TypeScript".to_owned(),
+            dependencies: vec!["express".to_owned()],
+            modern_file_paths: vec!["src/server.ts".to_owned()],
+            test_file_paths: vec!["tests/src/server.test.ts".to_owned()],
+            retries: 0,
+            token_usage: TicketTokenUsage::default(),
+            last_execution_diff: None,
+            last_ast_diff: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn state_writer_batches_updates_until_flush_interval() {
+        let (root, state_path) = make_temp_state_path("migration_pipeline_state_writer_batch");
+        let initial_tickets = vec![sample_ticket("TICKET-1")];
+        let (tx, rx) = mpsc::channel(4);
+        let state_path_string = state_path.to_string_lossy().into_owned();
+
+        let writer = tokio::spawn(run_state_writer_with_flush_interval(
+            state_path_string.clone(),
+            initial_tickets,
+            rx,
+            Duration::from_millis(100),
+        ));
+
+        tx.send(Ticket {
+            retries: 1,
+            ..sample_ticket("TICKET-1")
+        })
+        .await
+        .expect("update should send");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !state_path.exists(),
+            "state writer should not flush immediately for each update"
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let loaded = load_state(&state_path_string)
+            .expect("state should load")
+            .expect("state file should exist after flush");
+        assert_eq!(loaded[0].retries, 1);
+
+        drop(tx);
+        writer
+            .await
+            .expect("state writer should join")
+            .expect("state writer should succeed");
+
+        fs::remove_dir_all(root).expect("temp directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn state_writer_flushes_pending_updates_when_channel_closes() {
+        let (root, state_path) = make_temp_state_path("migration_pipeline_state_writer_close");
+        let initial_tickets = vec![sample_ticket("TICKET-1")];
+        let (tx, rx) = mpsc::channel(4);
+        let state_path_string = state_path.to_string_lossy().into_owned();
+
+        let writer = tokio::spawn(run_state_writer_with_flush_interval(
+            state_path_string.clone(),
+            initial_tickets,
+            rx,
+            Duration::from_secs(60),
+        ));
+
+        tx.send(Ticket {
+            retries: 2,
+            ..sample_ticket("TICKET-1")
+        })
+        .await
+        .expect("update should send");
+        drop(tx);
+
+        writer
+            .await
+            .expect("state writer should join")
+            .expect("state writer should succeed");
+
+        let loaded = load_state(&state_path_string)
+            .expect("state should load")
+            .expect("state file should exist after close flush");
+        assert_eq!(loaded[0].retries, 2);
+
+        fs::remove_dir_all(root).expect("temp directory should be removed");
+    }
+
+    #[test]
+    fn resolve_project_root_uses_startup_directory_once() {
+        let (root, _) = make_temp_state_path("migration_pipeline_root_resolution");
+        let legacy_root = root.join("legacy_app");
+        fs::create_dir_all(&legacy_root).expect("legacy root should be created");
+
+        let resolved = resolve_project_root(&root, Path::new("legacy_app"), false)
+            .expect("legacy root should resolve");
+
+        assert_eq!(resolved, legacy_root);
+
+        fs::remove_dir_all(root).expect("temp directory should be removed");
+    }
 }

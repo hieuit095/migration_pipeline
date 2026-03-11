@@ -1,77 +1,64 @@
-use anyhow::{Context, Result, anyhow};
-use reqwest::{Client, RequestBuilder, StatusCode};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashMap;
 use std::env;
 use std::fmt::{self, Display};
-use std::str::FromStr;
+use std::future::Future;
+use std::hash::Hash;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
+use zeroclaw::config::{ModelRouteConfig, ReliabilityConfig};
+use zeroclaw::providers::traits::TokenUsage as ZeroClawTokenUsage;
+use zeroclaw::providers::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, create_routed_provider,
+};
+use zeroclaw::tools::ToolSpec;
 
-const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const TOGETHER_URL: &str = "https://api.together.xyz/v1/chat/completions";
-const MAX_RETRIES: usize = 3;
+const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+const DOCKER_SANDBOX_MEMORY_ENV: &str = "DOCKER_SANDBOX_MEMORY";
+const DOCKER_SANDBOX_CPUS_ENV: &str = "DOCKER_SANDBOX_CPUS";
+const DEFAULT_TEMPERATURE: f64 = 0.1;
+const PROVIDER_NAME: &str = "openrouter";
+const MAX_FORMAT_RETRIES: usize = 3;
+const DEFAULT_DOCKER_SANDBOX_MEMORY: &str = "256m";
+const DEFAULT_DOCKER_SANDBOX_CPUS: &str = "0.5";
+const RATE_LIMIT_BACKOFFS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LlmProvider {
-    OpenRouter,
-    Together,
+type ChatFuture<'a> = Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>>;
+
+trait ChatBackend: Send + Sync {
+    fn chat<'a>(
+        &'a self,
+        request: ChatRequest<'a>,
+        model: &'a str,
+        temperature: f64,
+    ) -> ChatFuture<'a>;
 }
 
-impl LlmProvider {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::OpenRouter => "openrouter",
-            Self::Together => "together",
-        }
-    }
-
-    fn endpoint(self) -> &'static str {
-        match self {
-            Self::OpenRouter => OPENROUTER_URL,
-            Self::Together => TOGETHER_URL,
-        }
-    }
-
-    fn api_key_env(self) -> &'static str {
-        match self {
-            Self::OpenRouter => "OPENROUTER_API_KEY",
-            Self::Together => "TOGETHER_API_KEY",
-        }
-    }
-
-    fn decorate_request(self, request: RequestBuilder) -> RequestBuilder {
-        match self {
-            Self::OpenRouter => request
-                .header("HTTP-Referer", "https://github.com/openai/codex")
-                .header("X-Title", "migration_pipeline"),
-            Self::Together => request,
-        }
-    }
+struct ZeroClawBackend {
+    provider: Arc<dyn Provider>,
 }
 
-impl Display for LlmProvider {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for LlmProvider {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "openrouter" => Ok(Self::OpenRouter),
-            "together" | "together.ai" | "togetherai" => Ok(Self::Together),
-            other => Err(anyhow!(
-                "unsupported provider `{other}`; expected `openrouter` or `together`"
-            )),
-        }
+impl ChatBackend for ZeroClawBackend {
+    fn chat<'a>(
+        &'a self,
+        request: ChatRequest<'a>,
+        model: &'a str,
+        temperature: f64,
+    ) -> ChatFuture<'a> {
+        Box::pin(async move { self.provider.chat(request, model, temperature).await })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskKind {
     Blueprinter,
     Executor,
@@ -98,12 +85,12 @@ impl TaskKind {
         }
     }
 
-    fn provider_env(self) -> String {
-        format!("{}_PROVIDER", self.env_prefix())
-    }
-
     fn model_env(self) -> String {
         format!("{}_MODEL", self.env_prefix())
+    }
+
+    fn provider_env(self) -> String {
+        format!("{}_PROVIDER", self.env_prefix())
     }
 }
 
@@ -116,440 +103,807 @@ impl Display for TaskKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskModelConfig {
     pub task: TaskKind,
-    pub provider: LlmProvider,
     pub model: String,
+    pub hint: String,
 }
 
 impl TaskModelConfig {
-    pub fn new(task: TaskKind, provider: LlmProvider, model: impl Into<String>) -> Self {
+    pub fn new(task: TaskKind, model: impl Into<String>) -> Self {
         Self {
             task,
-            provider,
             model: model.into(),
+            hint: format!("hint:{}", task.as_str()),
         }
+    }
+
+    fn route_name(&self) -> &str {
+        self.hint.strip_prefix("hint:").unwrap_or(&self.hint)
+    }
+
+    fn as_model_route(&self) -> ModelRouteConfig {
+        ModelRouteConfig {
+            hint: self.route_name().to_owned(),
+            provider: PROVIDER_NAME.to_owned(),
+            model: self.model.clone(),
+            api_key: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerSandboxConfig {
+    pub memory_limit: String,
+    pub cpu_limit: String,
+}
+
+impl Default for DockerSandboxConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit: DEFAULT_DOCKER_SANDBOX_MEMORY.to_owned(),
+            cpu_limit: DEFAULT_DOCKER_SANDBOX_CPUS.to_owned(),
+        }
+    }
+}
+
+impl DockerSandboxConfig {
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            memory_limit: read_env_with_default(
+                DOCKER_SANDBOX_MEMORY_ENV,
+                DEFAULT_DOCKER_SANDBOX_MEMORY,
+            )?,
+            cpu_limit: read_env_with_default(DOCKER_SANDBOX_CPUS_ENV, DEFAULT_DOCKER_SANDBOX_CPUS)?,
+        })
     }
 }
 
 pub struct ModelRouter;
 
 impl ModelRouter {
-    pub fn from_env(
-        task: TaskKind,
-        default_provider: LlmProvider,
-        default_model: &str,
-    ) -> Result<TaskModelConfig> {
-        let provider_key = task.provider_env();
-        let model_key = task.model_env();
+    pub fn from_env(task: TaskKind, default_model: &str) -> Result<TaskModelConfig> {
+        let provider_env = task.provider_env();
+        if env::var(&provider_env)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            warn!(
+                task = task.as_str(),
+                env_var = provider_env.as_str(),
+                "Ignoring deprecated provider override; OpenRouter is the only supported provider for this pipeline"
+            );
+        }
 
-        let provider_value = match env::var(&provider_key) {
-            Ok(value) => Some(value),
-            Err(env::VarError::NotPresent) => None,
-            Err(error) => {
-                return Err(anyhow!("failed to read `{provider_key}`: {error}"));
-            }
-        };
+        let model_key = task.model_env();
         let model_value = match env::var(&model_key) {
-            Ok(value) => Some(value),
-            Err(env::VarError::NotPresent) => None,
+            Ok(value) if !value.trim().is_empty() => value,
+            Ok(_) => default_model.to_owned(),
+            Err(env::VarError::NotPresent) => default_model.to_owned(),
             Err(error) => {
                 return Err(anyhow!("failed to read `{model_key}`: {error}"));
             }
         };
 
-        resolve_task_model(
-            task,
-            default_provider,
-            default_model,
-            provider_value,
-            model_value,
-        )
-        .with_context(|| format!("failed to resolve model route for task `{task}`"))
+        Ok(TaskModelConfig::new(task, model_value))
+    }
+}
+
+fn read_env_with_default(key: &str, default: &str) -> Result<String> {
+    match env::var(key) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(default.to_owned()),
+        Err(error) => Err(anyhow!("failed to read `{key}`: {error}")),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ProjectTokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl ProjectTokenUsage {
+    fn from_provider_usage(usage: Option<&ZeroClawTokenUsage>) -> Self {
+        let prompt_tokens = usage
+            .and_then(|value| value.input_tokens)
+            .unwrap_or_default();
+        let completion_tokens = usage
+            .and_then(|value| value.output_tokens)
+            .unwrap_or_default();
+
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        }
+    }
+
+    fn accumulate(&mut self, other: Self) {
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StructuredCall {
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+    pub usage: ProjectTokenUsage,
+}
+
+impl StructuredCall {
+    pub fn deserialize_arguments<T>(&self) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        serde_json::from_value(self.arguments.clone()).with_context(|| {
+            format!(
+                "failed to deserialize structured call `{}` arguments",
+                self.tool_name
+            )
+        })
     }
 }
 
 #[derive(Clone)]
-pub struct LlmGateway {
-    client: Client,
+pub struct ZeroClawClient {
+    backend: Arc<dyn ChatBackend>,
+    task_configs: HashMap<TaskKind, TaskModelConfig>,
+    rate_limit_backoffs: Vec<Duration>,
+    max_format_retries: usize,
 }
 
-#[derive(Debug, Deserialize, Clone, Serialize, Default, PartialEq, Eq)]
-pub struct TokenUsage {
-    #[serde(default)]
-    pub prompt_tokens: u32,
-    #[serde(default)]
-    pub completion_tokens: u32,
-    #[serde(default)]
-    pub total_tokens: u32,
-}
+impl ZeroClawClient {
+    pub fn new(task_configs: Vec<TaskModelConfig>) -> Result<Self> {
+        let api_key = env::var(OPENROUTER_API_KEY_ENV).with_context(|| {
+            format!(
+                "{OPENROUTER_API_KEY_ENV} is not configured; OpenRouter is required for the ZeroClaw pipeline"
+            )
+        })?;
+        let default_model = task_configs
+            .first()
+            .map(|config| config.model.as_str())
+            .context("at least one task model configuration is required")?;
+        let model_routes = task_configs
+            .iter()
+            .map(TaskModelConfig::as_model_route)
+            .collect::<Vec<_>>();
+        let reliability = ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 0,
+            ..Default::default()
+        };
+        let provider = create_routed_provider(
+            PROVIDER_NAME,
+            Some(api_key.as_str()),
+            None,
+            &reliability,
+            &model_routes,
+            default_model,
+        )
+        .context("failed to initialize ZeroClaw OpenRouter provider router")?;
+        let provider: Arc<dyn Provider> = provider.into();
 
-#[derive(Debug, Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    temperature: f32,
-    messages: Vec<ChatMessage>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatCompletionResponse {
-    id: Option<String>,
-    model: Option<String>,
-    choices: Vec<ChatChoice>,
-    usage: Option<TokenUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatChoice {
-    message: ResponseMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseMessage {
-    content: serde_json::Value,
-}
-
-impl LlmGateway {
-    pub fn new() -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .context("failed to build LLM HTTP client")?;
-
-        Ok(Self { client })
+        Ok(Self {
+            backend: Arc::new(ZeroClawBackend { provider }),
+            task_configs: build_task_config_map(task_configs)?,
+            rate_limit_backoffs: RATE_LIMIT_BACKOFFS.to_vec(),
+            max_format_retries: MAX_FORMAT_RETRIES,
+        })
     }
 
-    pub async fn chat_completion(
+    pub fn model_for(&self, task: TaskKind) -> &str {
+        self.task_configs
+            .get(&task)
+            .map(|config| config.model.as_str())
+            .unwrap_or("unconfigured")
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        PROVIDER_NAME
+    }
+
+    #[allow(dead_code)]
+    pub async fn chat(
+        &self,
+        task: TaskKind,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<ChatResponse> {
+        let route = self.task_config(task)?;
+        let started_at = Instant::now();
+        let response = self
+            .dispatch_with_backoff(route, system_prompt, user_prompt, None)
+            .await
+            .with_context(|| format!("zeroclaw chat failed for task `{task}`"))?;
+        let usage = self.extract_usage(task, route, response.usage.as_ref());
+
+        info!(
+            target: "audit::llm",
+            provider = self.provider_name(),
+            task = task.as_str(),
+            model = route.model.as_str(),
+            latency_ms = started_at.elapsed().as_millis() as u64,
+            prompt_tokens = usage.prompt_tokens,
+            completion_tokens = usage.completion_tokens,
+            total_tokens = usage.total_tokens,
+            "Completed ZeroClaw chat request"
+        );
+
+        Ok(response)
+    }
+
+    pub async fn chat_with_schema(
+        &self,
+        task: TaskKind,
+        system_prompt: &str,
+        user_prompt: &str,
+        tool: ToolSpec,
+    ) -> Result<StructuredCall> {
+        let route = self.task_config(task)?;
+        let started_at = Instant::now();
+        let mut accumulated_usage = ProjectTokenUsage::default();
+        let mut last_error = None;
+
+        for format_attempt in 0..=self.max_format_retries {
+            let effective_system_prompt =
+                build_format_retry_prompt(system_prompt, &tool, format_attempt);
+            let response = self
+                .dispatch_with_backoff(
+                    route,
+                    &effective_system_prompt,
+                    user_prompt,
+                    Some(std::slice::from_ref(&tool)),
+                )
+                .await
+                .with_context(|| format!("zeroclaw structured chat failed for task `{task}`"))?;
+            let usage = self.extract_usage(task, route, response.usage.as_ref());
+            accumulated_usage.accumulate(usage);
+
+            match parse_structured_call(&response, &tool) {
+                Ok((tool_name, arguments)) => {
+                    info!(
+                        target: "audit::llm",
+                        provider = self.provider_name(),
+                        task = task.as_str(),
+                        model = route.model.as_str(),
+                        format_retries = format_attempt,
+                        latency_ms = started_at.elapsed().as_millis() as u64,
+                        prompt_tokens = accumulated_usage.prompt_tokens,
+                        completion_tokens = accumulated_usage.completion_tokens,
+                        total_tokens = accumulated_usage.total_tokens,
+                        "Completed ZeroClaw structured chat request"
+                    );
+
+                    return Ok(StructuredCall {
+                        tool_name,
+                        arguments,
+                        usage: accumulated_usage,
+                    });
+                }
+                Err(error) => {
+                    warn!(
+                        target: "audit::llm",
+                        provider = self.provider_name(),
+                        task = task.as_str(),
+                        model = route.model.as_str(),
+                        format_attempt = format_attempt + 1,
+                        error = %error,
+                        "LLM response violated the required structured output contract"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!(
+                "structured response retries exhausted for task `{}` and tool `{}`",
+                task,
+                tool.name
+            )
+        }))
+    }
+
+    #[cfg(test)]
+    fn with_backend_for_tests(
+        task_configs: Vec<TaskModelConfig>,
+        backend: Arc<dyn ChatBackend>,
+        rate_limit_backoffs: Vec<Duration>,
+        max_format_retries: usize,
+    ) -> Self {
+        Self {
+            backend,
+            task_configs: build_task_config_map(task_configs).expect("test task configs"),
+            rate_limit_backoffs,
+            max_format_retries,
+        }
+    }
+
+    fn task_config(&self, task: TaskKind) -> Result<&TaskModelConfig> {
+        self.task_configs
+            .get(&task)
+            .with_context(|| format!("missing task model configuration for task `{task}`"))
+    }
+
+    fn extract_usage(
+        &self,
+        task: TaskKind,
+        route: &TaskModelConfig,
+        usage: Option<&ZeroClawTokenUsage>,
+    ) -> ProjectTokenUsage {
+        if usage.is_none() {
+            warn!(
+                target: "audit::llm",
+                provider = self.provider_name(),
+                task = task.as_str(),
+                model = route.model.as_str(),
+                "LLM response did not include usage metadata; defaulting token usage to zero"
+            );
+        }
+
+        ProjectTokenUsage::from_provider_usage(usage)
+    }
+
+    async fn dispatch_with_backoff(
         &self,
         route: &TaskModelConfig,
         system_prompt: &str,
         user_prompt: &str,
-    ) -> Result<(String, TokenUsage)> {
-        let api_key_var = route.provider.api_key_env();
-        let api_key = env::var(api_key_var).with_context(|| {
-            format!(
-                "{api_key_var} is not configured for task `{}` using provider `{}`",
-                route.task, route.provider
-            )
-        })?;
-        let started_at = Instant::now();
-
-        let request = ChatCompletionRequest {
-            model: route.model.clone(),
-            temperature: 0.1,
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_owned(),
-                    content: system_prompt.to_owned(),
-                },
-                ChatMessage {
-                    role: "user".to_owned(),
-                    content: user_prompt.to_owned(),
-                },
-            ],
-        };
+        tools: Option<&[ToolSpec]>,
+    ) -> Result<ChatResponse> {
+        let messages = vec![
+            ChatMessage::system(system_prompt),
+            ChatMessage::user(user_prompt),
+        ];
+        let max_attempts = self.rate_limit_backoffs.len() + 1;
 
         debug!(
             target: "audit::llm",
-            provider = route.provider.as_str(),
+            provider = self.provider_name(),
             task = route.task.as_str(),
             model = route.model.as_str(),
             system_prompt = system_prompt,
             user_prompt = user_prompt,
-            request_payload = ?&request,
-            "LLM request payload"
+            tool_schemas = ?tools,
+            "Dispatching ZeroClaw request payload"
         );
 
         info!(
             target: "audit::llm",
-            provider = route.provider.as_str(),
+            provider = self.provider_name(),
             task = route.task.as_str(),
             model = route.model.as_str(),
             system_prompt_chars = system_prompt.len(),
             user_prompt_chars = user_prompt.len(),
-            "Dispatching LLM request"
+            tool_count = tools.map_or(0, <[ToolSpec]>::len),
+            "Dispatching ZeroClaw request"
         );
 
-        for attempt in 1..=MAX_RETRIES {
-            let request_builder = self
-                .client
-                .post(route.provider.endpoint())
-                .bearer_auth(&api_key)
-                .json(&request);
-            let response = route
-                .provider
-                .decorate_request(request_builder)
-                .send()
-                .await;
-
-            match response {
-                Ok(response) if response.status().is_success() => {
-                    let payload: ChatCompletionResponse = response
-                        .json()
-                        .await
-                        .context("failed to deserialize chat completion response body")?;
-                    debug!(
-                        target: "audit::llm",
-                        provider = route.provider.as_str(),
-                        task = route.task.as_str(),
-                        model = route.model.as_str(),
-                        response_payload = ?&payload,
-                        "LLM raw response payload"
-                    );
-                    let choice = payload
-                        .choices
-                        .into_iter()
-                        .next()
-                        .context("chat completion response contained no choices")?;
-                    let content = extract_message_text(choice.message.content)?;
-                    let usage = payload.usage.unwrap_or_else(|| {
-                        warn!(
-                            target: "audit::llm",
-                            provider = route.provider.as_str(),
-                            task = route.task.as_str(),
-                            model = route.model.as_str(),
-                            "LLM response did not include usage metadata; defaulting token usage to zero"
-                        );
-                        TokenUsage::default()
-                    });
-
-                    debug!(
-                        target: "audit::llm",
-                        provider = route.provider.as_str(),
-                        task = route.task.as_str(),
-                        model = route.model.as_str(),
-                        response_content = %content,
-                        "LLM response content"
-                    );
-
-                    info!(
-                        target: "audit::llm",
-                        provider = route.provider.as_str(),
-                        task = route.task.as_str(),
-                        model = route.model.as_str(),
-                        response_id = payload.id.as_deref().unwrap_or(""),
-                        response_model = payload.model.as_deref().unwrap_or(""),
-                        latency_ms = started_at.elapsed().as_millis() as u64,
-                        system_prompt_chars = system_prompt.len(),
-                        user_prompt_chars = user_prompt.len(),
-                        completion_chars = content.len(),
-                        prompt_tokens = usage.prompt_tokens,
-                        completion_tokens = usage.completion_tokens,
-                        total_tokens = usage.total_tokens,
-                        "Completed LLM request"
-                    );
-
-                    return Ok((content, usage));
-                }
+        for attempt in 0..max_attempts {
+            let request = ChatRequest {
+                messages: &messages,
+                tools,
+            };
+            match self
+                .backend
+                .chat(request, route.hint.as_str(), DEFAULT_TEMPERATURE)
+                .await
+            {
                 Ok(response) => {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    let error = anyhow!(
-                        "{} request for task `{}` failed with status {status}: {body}",
-                        route.provider,
-                        route.task
+                    debug!(
+                        target: "audit::llm",
+                        provider = self.provider_name(),
+                        task = route.task.as_str(),
+                        model = route.model.as_str(),
+                        raw_response = ?response,
+                        "Received ZeroClaw provider response"
                     );
-
-                    if attempt == MAX_RETRIES || !is_retryable_status(status) {
-                        return Err(error);
-                    }
-
+                    return Ok(response);
+                }
+                Err(error)
+                    if attempt < self.rate_limit_backoffs.len() && is_rate_limit_error(&error) =>
+                {
+                    let backoff = self.rate_limit_backoffs[attempt];
                     warn!(
                         target: "audit::llm",
-                        attempt,
-                        max_retries = MAX_RETRIES,
-                        provider = route.provider.as_str(),
+                        provider = self.provider_name(),
                         task = route.task.as_str(),
                         model = route.model.as_str(),
-                        %status,
-                        "LLM provider returned a retryable error"
+                        attempt = attempt + 1,
+                        max_attempts,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %error,
+                        "OpenRouter rate limited the request; retrying with exponential backoff"
                     );
+                    sleep(backoff).await;
                 }
                 Err(error) => {
-                    if attempt == MAX_RETRIES {
-                        return Err(anyhow!(
-                            "{} request for task `{}` failed after retries: {error}",
-                            route.provider,
-                            route.task
-                        ));
-                    }
-
-                    warn!(
-                        target: "audit::llm",
-                        attempt,
-                        max_retries = MAX_RETRIES,
-                        provider = route.provider.as_str(),
-                        task = route.task.as_str(),
-                        model = route.model.as_str(),
-                        error = %error,
-                        "LLM provider request failed, retrying"
-                    );
+                    return Err(error).with_context(|| {
+                        format!(
+                            "ZeroClaw provider request failed for task `{}` using model `{}`",
+                            route.task, route.model
+                        )
+                    });
                 }
             }
-
-            let backoff = Duration::from_secs(attempt as u64);
-            sleep(backoff).await;
         }
 
-        Err(anyhow!(
-            "chat completion retries exhausted for task `{}`",
-            route.task
-        ))
+        bail!(
+            "ZeroClaw rate-limit retries exhausted for task `{}` using model `{}`",
+            route.task,
+            route.model
+        )
     }
 }
 
-fn resolve_task_model(
-    task: TaskKind,
-    default_provider: LlmProvider,
-    default_model: &str,
-    provider_value: Option<String>,
-    model_value: Option<String>,
-) -> Result<TaskModelConfig> {
-    let has_provider_override = provider_value
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty());
-    let has_model_override = model_value
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty());
+fn build_task_config_map(
+    task_configs: Vec<TaskModelConfig>,
+) -> Result<HashMap<TaskKind, TaskModelConfig>> {
+    let mut map = HashMap::with_capacity(task_configs.len());
 
-    let provider = match provider_value {
-        Some(value) if !value.trim().is_empty() => value
-            .parse()
-            .with_context(|| format!("invalid provider override for task `{task}`"))?,
-        _ => default_provider,
-    };
-
-    if has_provider_override && provider != default_provider && !has_model_override {
-        return Err(anyhow!(
-            "task `{task}` overrides the provider to `{provider}` but does not set a matching model; set `{}` alongside `{}`",
-            task.model_env(),
-            task.provider_env()
-        ));
-    }
-
-    let model = match model_value {
-        Some(value) if !value.trim().is_empty() => value,
-        _ => default_model.to_owned(),
-    };
-
-    Ok(TaskModelConfig::new(task, provider, model))
-}
-
-fn is_retryable_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-}
-
-fn extract_message_text(content: serde_json::Value) -> Result<String> {
-    match content {
-        serde_json::Value::String(text) => Ok(text),
-        serde_json::Value::Array(parts) => {
-            let mut aggregated = String::new();
-            for part in parts {
-                if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
-                    aggregated.push_str(text);
-                }
-            }
-
-            if aggregated.is_empty() {
-                Err(anyhow!(
-                    "chat completion response did not contain textual message content"
-                ))
-            } else {
-                Ok(aggregated)
-            }
+    for config in task_configs {
+        if map.insert(config.task, config.clone()).is_some() {
+            bail!(
+                "duplicate task model configuration provided for task `{}`",
+                config.task
+            );
         }
-        other => Err(anyhow!(
-            "chat completion response content had an unsupported shape: {other}"
-        )),
     }
+
+    Ok(map)
+}
+
+fn build_format_retry_prompt(base_prompt: &str, tool: &ToolSpec, format_attempt: usize) -> String {
+    if format_attempt == 0 {
+        return base_prompt.to_owned();
+    }
+
+    format!(
+        concat!(
+            "{base_prompt}\n\n",
+            "FORMAT CORRECTION REQUIRED #{format_attempt}:\n",
+            "Your previous response did not use the required structured output.\n",
+            "You must respond by calling exactly one native tool named `{tool_name}`.\n",
+            "Do not return plain text, markdown fences, or explanations.\n",
+            "Tool arguments must match this JSON schema exactly: {schema}\n"
+        ),
+        base_prompt = base_prompt,
+        format_attempt = format_attempt,
+        tool_name = tool.name,
+        schema = tool.parameters
+    )
+}
+
+fn parse_structured_call(
+    response: &ChatResponse,
+    tool: &ToolSpec,
+) -> Result<(String, serde_json::Value)> {
+    if response.tool_calls.len() != 1 {
+        bail!(
+            "expected exactly one tool call named `{}`, received {} tool calls and text payload `{}`",
+            tool.name,
+            response.tool_calls.len(),
+            truncate_for_error(response.text.as_deref().unwrap_or_default())
+        );
+    }
+
+    let tool_call = &response.tool_calls[0];
+    if tool_call.name != tool.name {
+        bail!(
+            "expected tool call `{}`, received `{}`",
+            tool.name,
+            tool_call.name
+        );
+    }
+
+    let arguments =
+        serde_json::from_str::<serde_json::Value>(&tool_call.arguments).with_context(|| {
+            format!(
+                "tool call `{}` did not contain valid JSON arguments",
+                tool.name
+            )
+        })?;
+
+    Ok((tool_call.name.clone(), arguments))
+}
+
+fn truncate_for_error(value: &str) -> String {
+    const MAX_LEN: usize = 200;
+
+    if value.chars().count() <= MAX_LEN {
+        value.to_owned()
+    } else {
+        let truncated = value.chars().take(MAX_LEN).collect::<String>();
+        format!("{truncated}...")
+    }
+}
+
+fn is_rate_limit_error(error: &anyhow::Error) -> bool {
+    let normalized = error.to_string().to_ascii_lowercase();
+    normalized.contains("429")
+        || normalized.contains("too many requests")
+        || normalized.contains("rate limit")
+        || normalized.contains("rate-limited")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatCompletionResponse, LlmProvider, TaskKind, resolve_task_model};
+    use super::{
+        ChatBackend, DockerSandboxConfig, ModelRouter, ProjectTokenUsage, StructuredCall, TaskKind,
+        TaskModelConfig, ZeroClawClient,
+    };
+    use anyhow::{Result, anyhow};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use zeroclaw::providers::traits::TokenUsage;
+    use zeroclaw::providers::{ChatRequest, ChatResponse, ToolCall};
+    use zeroclaw::tools::ToolSpec;
 
-    #[test]
-    fn provider_parser_accepts_supported_values() {
-        assert_eq!(
-            "openrouter".parse::<LlmProvider>().unwrap(),
-            LlmProvider::OpenRouter
-        );
-        assert_eq!(
-            "together".parse::<LlmProvider>().unwrap(),
-            LlmProvider::Together
-        );
-        assert_eq!(
-            "together.ai".parse::<LlmProvider>().unwrap(),
-            LlmProvider::Together
-        );
+    #[derive(Default)]
+    struct ScriptedBackend {
+        responses: Mutex<VecDeque<Result<ChatResponse>>>,
+    }
+
+    impl ScriptedBackend {
+        fn new(responses: Vec<Result<ChatResponse>>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    impl ChatBackend for ScriptedBackend {
+        fn chat<'a>(
+            &'a self,
+            _request: ChatRequest<'a>,
+            _model: &'a str,
+            _temperature: f64,
+        ) -> super::ChatFuture<'a> {
+            Box::pin(async move {
+                let mut guard = self
+                    .responses
+                    .lock()
+                    .map_err(|_| anyhow!("scripted backend mutex was poisoned"))?;
+                guard
+                    .pop_front()
+                    .unwrap_or_else(|| Err(anyhow!("scripted backend ran out of responses")))
+            })
+        }
+    }
+
+    fn build_task_configs() -> Vec<TaskModelConfig> {
+        vec![
+            TaskModelConfig::new(TaskKind::Blueprinter, "google/gemini-3-flash-preview"),
+            TaskModelConfig::new(TaskKind::Executor, "minimax/minimax-m2.5"),
+            TaskModelConfig::new(TaskKind::Verifier, "z-ai/glm-5"),
+            TaskModelConfig::new(TaskKind::Surgeon, "anthropic/claude-3.5-sonnet"),
+        ]
+    }
+
+    fn verification_tool() -> ToolSpec {
+        ToolSpec {
+            name: "submit_verification_report".to_owned(),
+            description: "Return the verification result".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tests_passed": { "type": "boolean" },
+                    "sandbox_execution_errors": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": [
+                    "tests_passed",
+                    "sandbox_execution_errors"
+                ],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn response_with_tool_call(
+        arguments: serde_json::Value,
+        usage: Option<TokenUsage>,
+    ) -> ChatResponse {
+        ChatResponse {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "tool_1".to_owned(),
+                name: "submit_verification_report".to_owned(),
+                arguments: arguments.to_string(),
+            }],
+            usage,
+            reasoning_content: None,
+        }
     }
 
     #[test]
-    fn task_model_resolution_uses_defaults_when_overrides_are_missing() {
-        let route = resolve_task_model(
-            TaskKind::Blueprinter,
-            LlmProvider::OpenRouter,
-            "google/gemini-3-flash-preview",
-            None,
-            None,
-        )
-        .unwrap();
+    fn model_router_uses_default_model_when_env_is_missing() {
+        let route = ModelRouter::from_env(TaskKind::Blueprinter, "google/gemini-3-flash-preview")
+            .expect("model route should resolve");
 
-        assert_eq!(route.provider, LlmProvider::OpenRouter);
         assert_eq!(route.model, "google/gemini-3-flash-preview");
+        assert_eq!(route.hint, "hint:blueprinter");
     }
 
     #[test]
-    fn task_model_resolution_applies_provider_and_model_overrides() {
-        let route = resolve_task_model(
-            TaskKind::Executor,
-            LlmProvider::OpenRouter,
-            "default-model",
-            Some("together".to_owned()),
-            Some("openai/gpt-oss-20b".to_owned()),
-        )
-        .unwrap();
+    fn docker_sandbox_config_uses_defaults_when_env_is_missing() {
+        let previous_memory = std::env::var(super::DOCKER_SANDBOX_MEMORY_ENV).ok();
+        let previous_cpus = std::env::var(super::DOCKER_SANDBOX_CPUS_ENV).ok();
+        unsafe {
+            std::env::remove_var(super::DOCKER_SANDBOX_MEMORY_ENV);
+            std::env::remove_var(super::DOCKER_SANDBOX_CPUS_ENV);
+        }
 
-        assert_eq!(route.provider, LlmProvider::Together);
-        assert_eq!(route.model, "openai/gpt-oss-20b");
+        let config = DockerSandboxConfig::from_env().expect("sandbox config should load");
+
+        if let Some(value) = previous_memory {
+            unsafe {
+                std::env::set_var(super::DOCKER_SANDBOX_MEMORY_ENV, value);
+            }
+        }
+        if let Some(value) = previous_cpus {
+            unsafe {
+                std::env::set_var(super::DOCKER_SANDBOX_CPUS_ENV, value);
+            }
+        }
+
+        assert_eq!(config.memory_limit, "256m");
+        assert_eq!(config.cpu_limit, "0.5");
     }
 
     #[test]
-    fn task_model_resolution_requires_model_when_provider_changes() {
-        let error = resolve_task_model(
-            TaskKind::Blueprinter,
-            LlmProvider::OpenRouter,
-            "google/gemini-3-flash-preview",
-            Some("together".to_owned()),
-            None,
-        )
-        .unwrap_err();
+    fn zeroclaw_client_requires_openrouter_api_key() {
+        let previous = std::env::var(super::OPENROUTER_API_KEY_ENV).ok();
+        unsafe {
+            std::env::remove_var(super::OPENROUTER_API_KEY_ENV);
+        }
 
-        assert!(
-            error.to_string().contains("does not set a matching model"),
-            "unexpected error: {error}"
+        let error = ZeroClawClient::new(build_task_configs())
+            .err()
+            .expect("client should fail");
+
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var(super::OPENROUTER_API_KEY_ENV, value);
+            }
+        }
+
+        assert!(error.to_string().contains(super::OPENROUTER_API_KEY_ENV));
+    }
+
+    #[tokio::test]
+    async fn chat_with_schema_retries_plain_text_before_accepting_tool_call() {
+        let backend = Arc::new(ScriptedBackend::new(vec![
+            Ok(ChatResponse {
+                text: Some("Here is the report".to_owned()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(5),
+                }),
+                reasoning_content: None,
+            }),
+            Ok(response_with_tool_call(
+                serde_json::json!({
+                    "tests_passed": true,
+                    "sandbox_execution_errors": []
+                }),
+                Some(TokenUsage {
+                    input_tokens: Some(7),
+                    output_tokens: Some(3),
+                }),
+            )),
+        ]));
+        let client = ZeroClawClient::with_backend_for_tests(
+            build_task_configs(),
+            backend,
+            vec![Duration::ZERO],
+            3,
+        );
+
+        let call = client
+            .chat_with_schema(
+                TaskKind::Executor,
+                "Use the tool schema",
+                "Verify the code",
+                verification_tool(),
+            )
+            .await
+            .expect("structured call should succeed");
+
+        assert_eq!(call.tool_name, "submit_verification_report");
+        assert_eq!(
+            call.usage,
+            ProjectTokenUsage {
+                prompt_tokens: 18,
+                completion_tokens: 8,
+                total_tokens: 26,
+            }
         );
     }
 
-    #[test]
-    fn chat_completion_response_parses_usage_payload() {
-        let payload = serde_json::from_str::<ChatCompletionResponse>(
-            r#"{
-                "id":"resp_123",
-                "model":"google/gemini-3-flash-preview",
-                "choices":[{"message":{"content":"ok"}}],
-                "usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}
-            }"#,
-        )
-        .expect("response should deserialize");
+    #[tokio::test]
+    async fn chat_with_schema_retries_rate_limits() {
+        let backend = Arc::new(ScriptedBackend::new(vec![
+            Err(anyhow!("429 Too Many Requests")),
+            Ok(response_with_tool_call(
+                serde_json::json!({
+                    "tests_passed": true,
+                    "sandbox_execution_errors": []
+                }),
+                None,
+            )),
+        ]));
+        let client = ZeroClawClient::with_backend_for_tests(
+            build_task_configs(),
+            backend,
+            vec![Duration::ZERO],
+            0,
+        );
 
-        let usage = payload.usage.expect("usage should be present");
-        assert_eq!(usage.prompt_tokens, 11);
-        assert_eq!(usage.completion_tokens, 7);
-        assert_eq!(usage.total_tokens, 18);
+        let call = client
+            .chat_with_schema(
+                TaskKind::Executor,
+                "Use the tool schema",
+                "Verify the code",
+                verification_tool(),
+            )
+            .await
+            .expect("structured call should succeed after rate-limit retry");
+
+        assert_eq!(call.tool_name, "submit_verification_report");
+        assert_eq!(call.usage, ProjectTokenUsage::default());
+    }
+
+    #[tokio::test]
+    async fn chat_with_schema_rejects_wrong_tool_name() {
+        let backend = Arc::new(ScriptedBackend::new(vec![Ok(ChatResponse {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "tool_1".to_owned(),
+                name: "unexpected_tool".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+            usage: None,
+            reasoning_content: None,
+        })]));
+        let client =
+            ZeroClawClient::with_backend_for_tests(build_task_configs(), backend, Vec::new(), 0);
+
+        let error = client
+            .chat_with_schema(
+                TaskKind::Executor,
+                "Use the tool schema",
+                "Verify the code",
+                verification_tool(),
+            )
+            .await
+            .expect_err("structured call should fail");
+
+        assert!(error.to_string().contains("unexpected_tool"));
+    }
+
+    #[test]
+    fn structured_call_deserializes_arguments() {
+        let call = StructuredCall {
+            tool_name: "submit_verification_report".to_owned(),
+            arguments: serde_json::json!({
+                "tests_passed": true,
+                "sandbox_execution_errors": []
+            }),
+            usage: ProjectTokenUsage::default(),
+        };
+        let value = call
+            .deserialize_arguments::<serde_json::Value>()
+            .expect("arguments should deserialize");
+
+        assert_eq!(value["tests_passed"], true);
     }
 }

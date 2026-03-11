@@ -1,0 +1,873 @@
+use crate::config::DockerSandboxConfig;
+use crate::utils::path::{container_path, docker_bind_mount, normalize_relative_path};
+use anyhow::{Context, Result, bail, ensure};
+use async_trait::async_trait;
+use camino::Utf8PathBuf;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::process::Output;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::fs;
+use tracing::warn;
+
+use super::sandbox::{
+    APP_MOUNT_POINT, SANDBOX_TIMEOUT_SECS, build_container_name, preferred_output,
+    run_docker_command,
+};
+use super::{SandboxSkill, Skill};
+
+const SHADOW_MOUNT_POINT: &str = "/shadow";
+const CRITICAL_PERFORMANCE_RATIO: u64 = 5;
+const CRITICAL_PERFORMANCE_DELTA_MS: u64 = 50;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ShadowFixture {
+    pub id: String,
+    pub description: String,
+    #[serde(default)]
+    pub args: Vec<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ExecutionTarget {
+    pub relative_path: String,
+    pub callable: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ShadowTestRequest {
+    pub legacy_root: String,
+    pub modern_root: String,
+    pub legacy_target: ExecutionTarget,
+    pub modern_target: ExecutionTarget,
+    pub fixtures: Vec<ShadowFixture>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ExecutionRecord {
+    pub target: String,
+    pub command: String,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub return_value: Option<Value>,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct FixtureDiff {
+    pub fixture: ShadowFixture,
+    pub legacy: ExecutionRecord,
+    pub modern: ExecutionRecord,
+    pub output_matches: bool,
+    pub performance_regression: bool,
+    pub differences: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ExecutionDiff {
+    pub equivalent: bool,
+    pub fixture_diffs: Vec<FixtureDiff>,
+    pub sandbox_execution_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShadowTestSkill {
+    sandbox_skill: SandboxSkill,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadowRuntime {
+    Node,
+    Deno,
+    Python,
+}
+
+#[derive(Debug)]
+struct ShadowInvocation {
+    command: String,
+    container_name: String,
+    docker_args: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunnerRecord {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    return_value: Option<Value>,
+    duration_ms: u64,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+struct ShadowWorkspace {
+    root: PathBuf,
+}
+
+impl ShadowWorkspace {
+    async fn create() -> Result<Self> {
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock moved backwards while creating shadow test workspace")?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("migration_pipeline_shadow_{unique_id}"));
+        fs::create_dir_all(&root)
+            .await
+            .with_context(|| format!("failed to create shadow workspace {}", root.display()))?;
+        Ok(Self { root })
+    }
+
+    async fn write_fixture(&self, fixture: &ShadowFixture) -> Result<PathBuf> {
+        let file_name = format!("fixture_{}.json", sanitize_fixture_id(&fixture.id));
+        let path = self.root.join(file_name);
+        let payload = serde_json::to_string(fixture)
+            .with_context(|| format!("failed to serialize shadow fixture `{}`", fixture.id))?;
+        fs::write(&path, payload)
+            .await
+            .with_context(|| format!("failed to write shadow fixture {}", path.display()))?;
+        Ok(path)
+    }
+
+    async fn cleanup(self) -> Result<()> {
+        match fs::remove_dir_all(&self.root).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to remove shadow workspace {}", self.root.display())
+            }),
+        }
+    }
+}
+
+impl ShadowTestSkill {
+    pub fn new(config: DockerSandboxConfig) -> Self {
+        Self {
+            sandbox_skill: SandboxSkill::new(config),
+        }
+    }
+
+    async fn run_target(
+        &self,
+        label: &str,
+        root: &str,
+        target: &ExecutionTarget,
+        fixture_path: &Path,
+    ) -> Result<ExecutionRecord> {
+        let root = PathBuf::from(root);
+        let invocation =
+            build_invocation(&self.sandbox_skill, label, &root, target, fixture_path).await?;
+        let output = run_docker_command(
+            &invocation.docker_args,
+            Duration::from_secs(SANDBOX_TIMEOUT_SECS),
+            Some(invocation.container_name.as_str()),
+        )
+        .await
+        .with_context(|| format!("failed to run {label} shadow container"))?;
+
+        Ok(parse_execution_record(label, invocation.command, output))
+    }
+}
+
+impl Default for ShadowTestSkill {
+    fn default() -> Self {
+        Self::new(DockerSandboxConfig::default())
+    }
+}
+
+#[async_trait]
+impl Skill for ShadowTestSkill {
+    fn name(&self) -> &str {
+        "shadow_test"
+    }
+
+    async fn execute(&self, args: Vec<String>) -> Result<String> {
+        let request = parse_request(&args)?;
+        validate_request(&request)?;
+        self.sandbox_skill.ensure_docker_ready().await?;
+
+        let workspace = ShadowWorkspace::create().await?;
+        let execution_result = async {
+            let mut fixture_diffs = Vec::with_capacity(request.fixtures.len());
+            let mut sandbox_execution_errors = Vec::new();
+
+            for fixture in &request.fixtures {
+                let fixture_path = workspace.write_fixture(fixture).await?;
+                let (legacy_result, modern_result) = tokio::join!(
+                    self.run_target(
+                        "legacy",
+                        &request.legacy_root,
+                        &request.legacy_target,
+                        &fixture_path
+                    ),
+                    self.run_target(
+                        "modern",
+                        &request.modern_root,
+                        &request.modern_target,
+                        &fixture_path
+                    )
+                );
+
+                let legacy_record = legacy_result?;
+                let modern_record = modern_result?;
+                let fixture_diff = compare_fixture(fixture.clone(), legacy_record, modern_record);
+                sandbox_execution_errors.extend(
+                    fixture_diff
+                        .differences
+                        .iter()
+                        .filter(|difference| difference.contains("runner"))
+                        .cloned(),
+                );
+                let should_stop = should_fail_fast(&fixture_diff);
+                fixture_diffs.push(fixture_diff);
+                if should_stop {
+                    break;
+                }
+            }
+
+            let equivalent = fixture_diffs.iter().all(|fixture_diff| {
+                fixture_diff.output_matches && !fixture_diff.performance_regression
+            }) && sandbox_execution_errors.is_empty();
+
+            serde_json::to_string(&ExecutionDiff {
+                equivalent,
+                fixture_diffs,
+                sandbox_execution_errors,
+            })
+            .context("failed to serialize shadow execution diff")
+        }
+        .await;
+
+        if let Err(cleanup_error) = workspace.cleanup().await {
+            warn!(error = %cleanup_error, "Failed to clean up shadow workspace");
+        }
+
+        execution_result
+    }
+}
+
+fn parse_request(args: &[String]) -> Result<ShadowTestRequest> {
+    let raw_request = args
+        .first()
+        .context("ShadowTestSkill expects a single JSON request argument")?;
+    serde_json::from_str(raw_request).context("failed to deserialize shadow test request")
+}
+
+fn validate_request(request: &ShadowTestRequest) -> Result<()> {
+    ensure!(
+        !request.fixtures.is_empty(),
+        "ShadowTestSkill requires at least one generated fixture"
+    );
+    validate_target_path(&request.legacy_root, &request.legacy_target.relative_path)?;
+    validate_target_path(&request.modern_root, &request.modern_target.relative_path)?;
+    ensure!(
+        !request.legacy_target.callable.trim().is_empty(),
+        "legacy execution target callable cannot be empty"
+    );
+    ensure!(
+        !request.modern_target.callable.trim().is_empty(),
+        "modern execution target callable cannot be empty"
+    );
+    Ok(())
+}
+
+fn validate_target_path(root: &str, relative_path: &str) -> Result<()> {
+    let root_path = Path::new(root);
+    ensure!(
+        root_path.exists(),
+        "shadow root does not exist: {}",
+        root_path.display()
+    );
+    ensure!(
+        root_path.is_dir(),
+        "shadow root must be a directory: {}",
+        root_path.display()
+    );
+
+    let relative = normalize_relative_path(relative_path, "shadow execution target")?;
+    let full_path = root_path.join(relative.as_std_path());
+    ensure!(
+        full_path.exists() && full_path.is_file(),
+        "shadow execution target does not exist: {}",
+        full_path.display()
+    );
+    Ok(())
+}
+
+async fn build_invocation(
+    sandbox_skill: &SandboxSkill,
+    label: &str,
+    root: &Path,
+    target: &ExecutionTarget,
+    fixture_path: &Path,
+) -> Result<ShadowInvocation> {
+    let normalized_target =
+        normalize_relative_path(&target.relative_path, "shadow execution target")?;
+    let runtime = ShadowRuntime::from_path(&normalized_target)?;
+    let workspace_root = fixture_path
+        .parent()
+        .context("fixture path must have a parent directory")?;
+    let module_path = container_path(APP_MOUNT_POINT, normalized_target.as_path());
+    let fixture_mount_path = format!(
+        "{SHADOW_MOUNT_POINT}/{}",
+        fixture_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("fixture file name was not valid unicode")?
+    );
+
+    let (image, runner_name, runner_contents, inner_command) =
+        runtime.build_command(label, &module_path, &target.callable, &fixture_mount_path);
+    let runner_host_path = workspace_root.join(runner_name);
+    fs::write(&runner_host_path, runner_contents)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to write shadow runner for {label} target {}",
+                runner_host_path.display()
+            )
+        })?;
+    let container_name = build_container_name(&format!("shadow-{label}"));
+
+    let mut docker_args = vec![
+        "run".to_owned(),
+        "--rm".to_owned(),
+        "--name".to_owned(),
+        container_name.clone(),
+        "--network=none".to_owned(),
+        format!("--memory={}", sandbox_skill.config().memory_limit),
+        format!("--cpus={}", sandbox_skill.config().cpu_limit),
+        "--cap-drop=ALL".to_owned(),
+        "--security-opt=no-new-privileges:true".to_owned(),
+        "--workdir".to_owned(),
+        APP_MOUNT_POINT.to_owned(),
+        "--mount".to_owned(),
+        docker_bind_mount(root, APP_MOUNT_POINT, true)?,
+        "--mount".to_owned(),
+        docker_bind_mount(workspace_root, SHADOW_MOUNT_POINT, true)?,
+        image.to_owned(),
+    ];
+    docker_args.extend(inner_command);
+
+    Ok(ShadowInvocation {
+        command: format!("docker {}", docker_args.join(" ")),
+        container_name,
+        docker_args,
+    })
+}
+
+fn parse_execution_record(label: &str, command: String, output: Output) -> ExecutionRecord {
+    let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let raw_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    match serde_json::from_str::<RunnerRecord>(&raw_stdout) {
+        Ok(record) => ExecutionRecord {
+            target: label.to_owned(),
+            command,
+            exit_code: record.exit_code,
+            stdout: record.stdout,
+            stderr: record.stderr,
+            return_value: record.return_value,
+            duration_ms: record.duration_ms,
+            error: record.error,
+        },
+        Err(_) => ExecutionRecord {
+            target: label.to_owned(),
+            command,
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: raw_stdout.trim().to_owned(),
+            stderr: raw_stderr.trim().to_owned(),
+            return_value: None,
+            duration_ms: 0,
+            error: Some(preferred_output(&raw_stderr, &raw_stdout)),
+        },
+    }
+}
+
+fn compare_fixture(
+    fixture: ShadowFixture,
+    legacy: ExecutionRecord,
+    modern: ExecutionRecord,
+) -> FixtureDiff {
+    let mut differences = Vec::new();
+
+    if legacy.exit_code != modern.exit_code {
+        differences.push(format!(
+            "fixture `{}` exit code mismatch: legacy={} modern={}",
+            fixture.id, legacy.exit_code, modern.exit_code
+        ));
+    }
+    if legacy.return_value != modern.return_value {
+        differences.push(format!(
+            "fixture `{}` return value mismatch: legacy={:?} modern={:?}",
+            fixture.id, legacy.return_value, modern.return_value
+        ));
+    }
+    if normalize_output(&legacy.stdout) != normalize_output(&modern.stdout) {
+        differences.push(format!(
+            "fixture `{}` stdout mismatch: legacy=`{}` modern=`{}`",
+            fixture.id,
+            normalize_output(&legacy.stdout),
+            normalize_output(&modern.stdout)
+        ));
+    }
+    if normalize_output(&legacy.stderr) != normalize_output(&modern.stderr) {
+        differences.push(format!(
+            "fixture `{}` stderr mismatch: legacy=`{}` modern=`{}`",
+            fixture.id,
+            normalize_output(&legacy.stderr),
+            normalize_output(&modern.stderr)
+        ));
+    }
+    if let Some(error) = &legacy.error {
+        differences.push(format!(
+            "fixture `{}` legacy runner error: {error}",
+            fixture.id
+        ));
+    }
+    if let Some(error) = &modern.error {
+        differences.push(format!(
+            "fixture `{}` modern runner error: {error}",
+            fixture.id
+        ));
+    }
+
+    let performance_regression = is_critical_performance_regression(&legacy, &modern);
+    if performance_regression {
+        differences.push(format!(
+            "fixture `{}` critical performance regression: legacy={}ms modern={}ms",
+            fixture.id, legacy.duration_ms, modern.duration_ms
+        ));
+    }
+
+    FixtureDiff {
+        fixture,
+        legacy,
+        modern,
+        output_matches: differences.is_empty(),
+        performance_regression,
+        differences,
+    }
+}
+
+fn should_fail_fast(fixture_diff: &FixtureDiff) -> bool {
+    !fixture_diff.output_matches || fixture_diff.performance_regression
+}
+
+fn is_critical_performance_regression(legacy: &ExecutionRecord, modern: &ExecutionRecord) -> bool {
+    if legacy.duration_ms == 0 {
+        return modern.duration_ms > CRITICAL_PERFORMANCE_DELTA_MS;
+    }
+
+    modern.duration_ms
+        > legacy
+            .duration_ms
+            .saturating_mul(CRITICAL_PERFORMANCE_RATIO)
+        && modern.duration_ms.saturating_sub(legacy.duration_ms) > CRITICAL_PERFORMANCE_DELTA_MS
+}
+
+fn normalize_output(value: &str) -> String {
+    value.trim().replace("\r\n", "\n")
+}
+
+fn sanitize_fixture_id(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    sanitized.trim_matches('-').to_owned()
+}
+
+fn sanitize_runner_label(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        "shadow".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+impl ShadowRuntime {
+    fn from_path(relative_path: &Utf8PathBuf) -> Result<Self> {
+        match relative_path
+            .extension()
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("js") | Some("mjs") | Some("cjs") => Ok(Self::Node),
+            Some("ts") | Some("tsx") => Ok(Self::Deno),
+            Some("py") => Ok(Self::Python),
+            Some(other) => bail!(
+                "ShadowTestSkill does not support the `.{other}` extension for shadow execution yet"
+            ),
+            None => bail!("ShadowTestSkill requires a target file with a supported extension"),
+        }
+    }
+
+    fn build_command(
+        self,
+        label: &str,
+        module_path: &str,
+        callable: &str,
+        fixture_path: &str,
+    ) -> (&'static str, String, &'static str, Vec<String>) {
+        let runner_label = sanitize_runner_label(label);
+        match self {
+            Self::Node => (
+                "node:alpine",
+                format!("{runner_label}_shadow_runner.mjs"),
+                NODE_SHADOW_RUNNER,
+                vec![
+                    "node".to_owned(),
+                    format!("{SHADOW_MOUNT_POINT}/{runner_label}_shadow_runner.mjs"),
+                    module_path.to_owned(),
+                    callable.to_owned(),
+                    fixture_path.to_owned(),
+                ],
+            ),
+            Self::Deno => (
+                "denoland/deno:alpine",
+                format!("{runner_label}_shadow_runner.ts"),
+                DENO_SHADOW_RUNNER,
+                vec![
+                    "deno".to_owned(),
+                    "run".to_owned(),
+                    "--allow-read".to_owned(),
+                    format!("{SHADOW_MOUNT_POINT}/{runner_label}_shadow_runner.ts"),
+                    module_path.to_owned(),
+                    callable.to_owned(),
+                    fixture_path.to_owned(),
+                ],
+            ),
+            Self::Python => (
+                "python:alpine",
+                format!("{runner_label}_shadow_runner.py"),
+                PYTHON_SHADOW_RUNNER,
+                vec![
+                    "python".to_owned(),
+                    format!("{SHADOW_MOUNT_POINT}/{runner_label}_shadow_runner.py"),
+                    module_path.to_owned(),
+                    callable.to_owned(),
+                    fixture_path.to_owned(),
+                ],
+            ),
+        }
+    }
+}
+
+const NODE_SHADOW_RUNNER: &str = r#"
+import fs from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
+
+const stringify = (value) => {
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
+};
+
+const captureConsole = () => {
+  const stdout = [];
+  const stderr = [];
+  const original = { log: console.log, warn: console.warn, error: console.error };
+  console.log = (...args) => stdout.push(args.map(stringify).join(' '));
+  console.warn = (...args) => stderr.push(args.map(stringify).join(' '));
+  console.error = (...args) => stderr.push(args.map(stringify).join(' '));
+  return { stdout, stderr, restore: () => { console.log = original.log; console.warn = original.warn; console.error = original.error; } };
+};
+
+const [, , modulePath, callableName, fixturePath] = process.argv;
+const fixture = JSON.parse(await fs.readFile(fixturePath, 'utf8'));
+const captured = captureConsole();
+const startedAt = performance.now();
+let exitCode = 0;
+let returnValue = null;
+let error = null;
+
+try {
+  const module = await import(`file://${modulePath}`);
+  const callable = callableName === 'default' ? module.default : module[callableName];
+  if (typeof callable !== 'function') {
+    throw new Error(`callable ${callableName} was not found in ${modulePath}`);
+  }
+  returnValue = await callable(...(fixture.args ?? []));
+} catch (failure) {
+  exitCode = 1;
+  error = String(failure?.stack ?? failure);
+  captured.stderr.push(error);
+} finally {
+  captured.restore();
+}
+
+process.stdout.write(JSON.stringify({
+  exit_code: exitCode,
+  stdout: captured.stdout.join('\n'),
+  stderr: captured.stderr.join('\n'),
+  return_value: returnValue,
+  duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+  error,
+}));
+process.exitCode = exitCode;
+"#;
+
+const DENO_SHADOW_RUNNER: &str = r#"
+const stringify = (value: unknown): string => {
+  if (typeof value === "string") return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
+};
+
+const captureConsole = () => {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const original = { log: console.log, warn: console.warn, error: console.error };
+  console.log = (...args: unknown[]) => stdout.push(args.map(stringify).join(" "));
+  console.warn = (...args: unknown[]) => stderr.push(args.map(stringify).join(" "));
+  console.error = (...args: unknown[]) => stderr.push(args.map(stringify).join(" "));
+  return { stdout, stderr, restore: () => { console.log = original.log; console.warn = original.warn; console.error = original.error; } };
+};
+
+const [modulePath, callableName, fixturePath] = Deno.args;
+const fixture = JSON.parse(await Deno.readTextFile(fixturePath));
+const captured = captureConsole();
+const startedAt = performance.now();
+let exitCode = 0;
+let returnValue: unknown = null;
+let error: string | null = null;
+
+try {
+  const module = await import(`file://${modulePath}`);
+  const callable = callableName === "default" ? module.default : module[callableName];
+  if (typeof callable !== "function") {
+    throw new Error(`callable ${callableName} was not found in ${modulePath}`);
+  }
+  returnValue = await callable(...(fixture.args ?? []));
+} catch (failure) {
+  exitCode = 1;
+  error = failure instanceof Error ? (failure.stack ?? failure.message) : String(failure);
+  captured.stderr.push(error);
+} finally {
+  captured.restore();
+}
+
+await Deno.stdout.write(
+  new TextEncoder().encode(
+    JSON.stringify({
+      exit_code: exitCode,
+      stdout: captured.stdout.join("\n"),
+      stderr: captured.stderr.join("\n"),
+      return_value: returnValue,
+      duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+      error,
+    }),
+  ),
+);
+Deno.exit(exitCode);
+"#;
+
+const PYTHON_SHADOW_RUNNER: &str = r#"
+import contextlib
+import importlib.util
+import io
+import json
+import sys
+import time
+
+module_path, callable_name, fixture_path = sys.argv[1:4]
+with open(fixture_path, "r", encoding="utf-8") as handle:
+    fixture = json.load(handle)
+
+stdout_buffer = io.StringIO()
+stderr_buffer = io.StringIO()
+started_at = time.perf_counter()
+exit_code = 0
+return_value = None
+error = None
+
+try:
+    spec = importlib.util.spec_from_file_location("shadow_module", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    callable_obj = getattr(module, callable_name if callable_name != "default" else "__call__", None)
+    if callable_name == "default" and callable_obj is None:
+        callable_obj = getattr(module, "main", None)
+    if not callable(callable_obj):
+        raise RuntimeError(f"callable {callable_name} was not found in {module_path}")
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+        return_value = callable_obj(*(fixture.get("args") or []))
+except Exception as failure:
+    exit_code = 1
+    error = str(failure)
+    stderr_buffer.write(error)
+
+payload = {
+    "exit_code": exit_code,
+    "stdout": stdout_buffer.getvalue(),
+    "stderr": stderr_buffer.getvalue(),
+    "return_value": return_value,
+    "duration_ms": max(0, round((time.perf_counter() - started_at) * 1000)),
+    "error": error,
+}
+sys.stdout.write(json.dumps(payload))
+sys.exit(exit_code)
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ExecutionRecord, ExecutionTarget, FixtureDiff, ShadowFixture, ShadowRuntime,
+        ShadowTestRequest, compare_fixture, is_critical_performance_regression, should_fail_fast,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn compare_fixture_detects_return_value_mismatch() {
+        let fixture = ShadowFixture {
+            id: "fx-1".to_owned(),
+            description: "basic case".to_owned(),
+            args: vec![json!(1)],
+        };
+        let legacy = ExecutionRecord {
+            target: "legacy".to_owned(),
+            return_value: Some(json!(1)),
+            ..Default::default()
+        };
+        let modern = ExecutionRecord {
+            target: "modern".to_owned(),
+            return_value: Some(json!(2)),
+            ..Default::default()
+        };
+
+        let diff = compare_fixture(fixture, legacy, modern);
+        assert!(!diff.output_matches);
+        assert!(
+            diff.differences
+                .iter()
+                .any(|difference| difference.contains("return value mismatch"))
+        );
+    }
+
+    #[test]
+    fn performance_regression_is_flagged_for_large_slowdowns() {
+        let legacy = ExecutionRecord {
+            duration_ms: 20,
+            ..Default::default()
+        };
+        let modern = ExecutionRecord {
+            duration_ms: 200,
+            ..Default::default()
+        };
+
+        assert!(is_critical_performance_regression(&legacy, &modern));
+    }
+
+    #[test]
+    fn shadow_request_round_trips_through_json() {
+        let request = ShadowTestRequest {
+            legacy_root: "./legacy_app".to_owned(),
+            modern_root: "./modern_app".to_owned(),
+            legacy_target: ExecutionTarget {
+                relative_path: "src/server.js".to_owned(),
+                callable: "bootstrap".to_owned(),
+            },
+            modern_target: ExecutionTarget {
+                relative_path: "src/server.ts".to_owned(),
+                callable: "bootstrap".to_owned(),
+            },
+            fixtures: vec![ShadowFixture {
+                id: "fx-1".to_owned(),
+                description: "basic".to_owned(),
+                args: vec![json!(1), json!(2)],
+            }],
+        };
+
+        let payload = serde_json::to_string(&request).expect("request should serialize");
+        let restored: ShadowTestRequest =
+            serde_json::from_str(&payload).expect("request should deserialize");
+
+        assert_eq!(restored.fixtures.len(), 1);
+        assert_eq!(restored.modern_target.callable, "bootstrap");
+    }
+
+    #[test]
+    fn fail_fast_triggers_for_fixture_mismatch() {
+        let fixture = ShadowFixture {
+            id: "fx-1".to_owned(),
+            description: "basic".to_owned(),
+            args: Vec::new(),
+        };
+        let fixture_diff = FixtureDiff {
+            fixture,
+            output_matches: false,
+            performance_regression: false,
+            differences: vec!["mismatch".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(should_fail_fast(&fixture_diff));
+    }
+
+    #[test]
+    fn fail_fast_does_not_trigger_for_passing_fixture() {
+        let fixture = ShadowFixture {
+            id: "fx-2".to_owned(),
+            description: "basic".to_owned(),
+            args: Vec::new(),
+        };
+        let fixture_diff = FixtureDiff {
+            fixture,
+            output_matches: true,
+            performance_regression: false,
+            differences: Vec::new(),
+            ..Default::default()
+        };
+
+        assert!(!should_fail_fast(&fixture_diff));
+    }
+
+    #[test]
+    fn build_command_uses_label_specific_runner_name() {
+        let (_, legacy_runner_name, _, legacy_command) = ShadowRuntime::Node.build_command(
+            "legacy",
+            "/app/src/server.js",
+            "bootstrap",
+            "/shadow/fixture.json",
+        );
+        let (_, modern_runner_name, _, modern_command) = ShadowRuntime::Node.build_command(
+            "modern",
+            "/app/src/server.js",
+            "bootstrap",
+            "/shadow/fixture.json",
+        );
+
+        assert_eq!(legacy_runner_name, "legacy_shadow_runner.mjs");
+        assert_eq!(modern_runner_name, "modern_shadow_runner.mjs");
+        assert!(
+            legacy_command
+                .iter()
+                .any(|argument| argument == "/shadow/legacy_shadow_runner.mjs")
+        );
+        assert!(
+            modern_command
+                .iter()
+                .any(|argument| argument == "/shadow/modern_shadow_runner.mjs")
+        );
+    }
+}

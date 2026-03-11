@@ -2,25 +2,43 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use async_trait::async_trait;
+use serde::Deserialize;
 use tracing::{info, warn};
+use zeroclaw::tools::ToolSpec;
 
-use crate::config::{LlmGateway, LlmProvider, TaskModelConfig};
+use crate::config::{TaskKind, ZeroClawClient};
 use crate::skills::Skill;
-use crate::utils::clean_code_response;
+use crate::utils::path::normalize_relative_path as normalize_portable_relative_path;
 
 use super::{Agent, Ticket, TicketStatus};
 
 const EXECUTOR_NAME: &str = "executor";
 const DEFAULT_EXECUTOR_MODEL: &str = "minimax/minimax-m2.5";
 
+#[derive(Debug, Deserialize)]
+struct GeneratedArtifactsPayload {
+    source_files: Vec<GeneratedFile>,
+    test_files: Vec<GeneratedFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeneratedFile {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug)]
+struct PersistedArtifacts {
+    source_files: Vec<String>,
+    test_files: Vec<String>,
+}
+
 pub struct ExecutorAgent {
     legacy_root: PathBuf,
     output_root: PathBuf,
     file_io_skill: Arc<dyn Skill>,
     file_write_skill: Arc<dyn Skill>,
-    route: TaskModelConfig,
-    llm_gateway: LlmGateway,
+    llm_client: Arc<ZeroClawClient>,
 }
 
 impl ExecutorAgent {
@@ -29,16 +47,14 @@ impl ExecutorAgent {
         output_root: impl Into<PathBuf>,
         file_io_skill: Arc<dyn Skill>,
         file_write_skill: Arc<dyn Skill>,
-        llm_gateway: LlmGateway,
-        route: TaskModelConfig,
+        llm_client: Arc<ZeroClawClient>,
     ) -> Self {
         Self {
             legacy_root: legacy_root.into(),
             output_root: output_root.into(),
             file_io_skill,
             file_write_skill,
-            route,
-            llm_gateway,
+            llm_client,
         }
     }
 
@@ -46,59 +62,53 @@ impl ExecutorAgent {
         DEFAULT_EXECUTOR_MODEL
     }
 
-    pub fn provider(&self) -> LlmProvider {
-        self.route.provider
+    pub fn provider(&self) -> &'static str {
+        self.llm_client.provider_name()
     }
 
-    async fn execute_ticket(&self, ticket: &mut Ticket) -> Result<PathBuf> {
+    async fn execute_ticket(&self, ticket: &mut Ticket) -> Result<PersistedArtifacts> {
         let legacy_context = self
             .load_legacy_context(ticket)
+            .await
             .with_context(|| format!("failed to load legacy context for ticket {}", ticket.id))?;
-        let output_relative_path = self.determine_output_relative_path(ticket);
-        let response = self
-            .llm_gateway
-            .chat_completion(
-                &self.route,
+        let suggested_source_path = determine_output_relative_path(ticket)?;
+        let suggested_test_path = determine_test_output_relative_path(&suggested_source_path)?;
+        let structured_call = self
+            .llm_client
+            .chat_with_schema(
+                TaskKind::Executor,
                 &self.system_prompt(ticket),
-                &self.user_prompt(ticket, &legacy_context, &output_relative_path),
+                &self.user_prompt(
+                    ticket,
+                    &legacy_context,
+                    &suggested_source_path,
+                    &suggested_test_path,
+                ),
+                self.generated_artifacts_tool(),
             )
             .await
             .with_context(|| format!("executor model failed for ticket {}", ticket.id))?;
-        let (response, usage) = response;
         info!(
             ticket_id = ticket.id.as_str(),
-            model = self.route.model.as_str(),
-            prompt_tokens = usage.prompt_tokens,
-            completion_tokens = usage.completion_tokens,
-            total_tokens = usage.total_tokens,
+            model = self.model(),
+            prompt_tokens = structured_call.usage.prompt_tokens,
+            completion_tokens = structured_call.usage.completion_tokens,
+            total_tokens = structured_call.usage.total_tokens,
             "Executor token usage"
         );
-        ticket.record_llm_usage(&usage);
-        let generated_code = clean_code_response(&response);
+        ticket.record_llm_usage(&structured_call.usage);
+        let payload: GeneratedArtifactsPayload = structured_call.deserialize_arguments()?;
 
-        ensure!(
-            !generated_code.trim().is_empty(),
-            "executor returned empty code for ticket {}",
-            ticket.id
-        );
-
-        let output_path = self.output_root.join(&output_relative_path);
-        self.file_write_skill
-            .execute(vec![
-                output_path.to_string_lossy().into_owned(),
-                generated_code,
-            ])
-            .with_context(|| {
-                format!(
-                    "failed to persist generated output for ticket {}",
-                    ticket.id
-                )
-            })?;
-
-        Ok(output_path)
+        self.persist_generated_artifacts(
+            ticket,
+            payload,
+            &suggested_source_path,
+            &suggested_test_path,
+        )
+        .await
     }
 
-    fn load_legacy_context(&self, ticket: &Ticket) -> Result<String> {
+    async fn load_legacy_context(&self, ticket: &Ticket) -> Result<String> {
         if ticket.context_files.is_empty() {
             if ticket.legacy_code_snippet.trim().is_empty() {
                 return Err(anyhow!(
@@ -115,23 +125,114 @@ impl ExecutorAgent {
 
         let mut args = vec![self.legacy_root.to_string_lossy().into_owned()];
         args.extend(ticket.context_files.iter().cloned());
-        self.file_io_skill.execute(args)
+        self.file_io_skill.execute(args).await
+    }
+
+    async fn persist_generated_artifacts(
+        &self,
+        ticket: &Ticket,
+        payload: GeneratedArtifactsPayload,
+        suggested_source_path: &str,
+        suggested_test_path: &str,
+    ) -> Result<PersistedArtifacts> {
+        ensure!(
+            !payload.source_files.is_empty(),
+            "executor returned no source files for ticket {}",
+            ticket.id
+        );
+        ensure!(
+            !payload.test_files.is_empty(),
+            "executor returned no test files for ticket {}",
+            ticket.id
+        );
+
+        let source_files = self
+            .persist_files(
+                "source",
+                ticket,
+                payload.source_files,
+                suggested_source_path,
+            )
+            .await?;
+        let test_files = self
+            .persist_files("test", ticket, payload.test_files, suggested_test_path)
+            .await?;
+
+        Ok(PersistedArtifacts {
+            source_files,
+            test_files,
+        })
+    }
+
+    async fn persist_files(
+        &self,
+        file_role: &str,
+        ticket: &Ticket,
+        files: Vec<GeneratedFile>,
+        suggested_primary_path: &str,
+    ) -> Result<Vec<String>> {
+        let mut persisted_paths = Vec::with_capacity(files.len());
+        let mut includes_suggested_path = false;
+
+        for file in files {
+            ensure!(
+                !file.content.trim().is_empty(),
+                "executor returned empty {file_role} content for ticket {} at path `{}`",
+                ticket.id,
+                file.path
+            );
+
+            let relative_path = normalize_relative_path(&file.path).with_context(|| {
+                format!(
+                    "executor returned an invalid {file_role} file path for ticket {}",
+                    ticket.id
+                )
+            })?;
+            if relative_path == suggested_primary_path {
+                includes_suggested_path = true;
+            }
+
+            let absolute_path = self.output_root.join(&relative_path);
+            self.file_write_skill
+                .execute(vec![absolute_path.to_string_lossy().into_owned(), file.content])
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to persist generated {file_role} output `{relative_path}` for ticket {}",
+                        ticket.id
+                    )
+                })?;
+
+            if !persisted_paths.contains(&relative_path) {
+                persisted_paths.push(relative_path);
+            }
+        }
+
+        if !includes_suggested_path {
+            warn!(
+                ticket_id = ticket.id.as_str(),
+                file_role,
+                suggested_primary_path,
+                "Executor generated files did not include the suggested primary path"
+            );
+        }
+
+        Ok(persisted_paths)
     }
 
     fn system_prompt(&self, ticket: &Ticket) -> String {
         format!(
             concat!(
                 "You are a Senior Developer specializing in {framework} migrations.\n",
-                "Translate the provided legacy code into compile-ready {framework} source code.\n",
-                "Return raw source code only.\n",
+                "Translate the provided legacy code into compile-ready source files and matching runnable tests.\n",
+                "You must respond by calling the provided tool exactly once.\n",
                 "Rules:\n",
-                "1. No markdown fences.\n",
-                "2. No explanatory text.\n",
-                "3. No \"Here is the code\" preambles.\n",
-                "4. Do not include path headers or file markers in the output.\n",
+                "1. Return both `source_files` and `test_files`.\n",
+                "2. Each file `content` must be raw compile-ready source code.\n",
+                "3. Tests must run in an isolated Docker sandbox with no network access and no dependency installation.\n",
+                "4. Use relative paths only.\n",
                 "5. Preserve semantic behavior, data contracts, and side effects from the legacy code.\n",
-                "6. Generate exactly one source file body suitable for the requested output path.\n",
-                "7. Use any listed dependencies only when they are necessary.\n"
+                "6. Make the tests deterministic and self-contained.\n"
             ),
             framework = ticket.target_framework
         )
@@ -141,7 +242,8 @@ impl ExecutorAgent {
         &self,
         ticket: &Ticket,
         legacy_context: &str,
-        output_relative_path: &str,
+        suggested_source_path: &str,
+        suggested_test_path: &str,
     ) -> String {
         let dependencies = if ticket.dependencies.is_empty() {
             "None".to_owned()
@@ -159,7 +261,8 @@ impl ExecutorAgent {
                 "Ticket ID: {ticket_id}\n",
                 "Task: {description}\n",
                 "Target framework: {target_framework}\n",
-                "Output path: {output_relative_path}\n",
+                "Suggested primary source path: {suggested_source_path}\n",
+                "Suggested primary test path: {suggested_test_path}\n",
                 "Dependencies: {dependencies}\n",
                 "Relevant legacy files: {context_files}\n",
                 "Legacy snippet anchor:\n",
@@ -170,7 +273,8 @@ impl ExecutorAgent {
             ticket_id = ticket.id,
             description = ticket.description,
             target_framework = ticket.target_framework,
-            output_relative_path = output_relative_path,
+            suggested_source_path = suggested_source_path,
+            suggested_test_path = suggested_test_path,
             dependencies = dependencies,
             context_files = context_files,
             legacy_snippet = ticket.legacy_code_snippet,
@@ -178,67 +282,47 @@ impl ExecutorAgent {
         )
     }
 
-    fn determine_output_relative_path(&self, ticket: &Ticket) -> String {
-        let default_filename = sanitize_for_filename(&ticket.id);
-        let source_relative_path = ticket
-            .context_files
-            .first()
-            .cloned()
-            .unwrap_or_else(|| format!("generated/{default_filename}.txt"));
-        let source_path = Path::new(&source_relative_path);
-        let extension = target_extension(
-            &ticket.target_framework,
-            source_path.extension().and_then(|value| value.to_str()),
-        );
-        let file_stem = source_path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or(default_filename);
-
-        let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
-        let output_file_name = format!("{file_stem}.{extension}");
-
-        if parent.as_os_str().is_empty() {
-            output_file_name
-        } else {
-            parent
-                .join(output_file_name)
-                .to_string_lossy()
-                .replace('\\', "/")
+    fn generated_artifacts_tool(&self) -> ToolSpec {
+        ToolSpec {
+            name: "submit_generated_artifacts".to_owned(),
+            description: "Return the generated modern source files and runnable tests".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source_files": file_array_schema(),
+                    "test_files": file_array_schema()
+                },
+                "required": ["source_files", "test_files"],
+                "additionalProperties": false
+            }),
         }
     }
 }
 
-#[async_trait]
 impl Agent for ExecutorAgent {
     fn name(&self) -> &str {
         EXECUTOR_NAME
     }
 
     fn model(&self) -> &str {
-        &self.route.model
+        self.llm_client.model_for(TaskKind::Executor)
     }
 
     async fn process_ticket(&self, ticket: &Ticket) -> Result<Ticket> {
         let mut updated_ticket = ticket.clone();
 
         match self.execute_ticket(&mut updated_ticket).await {
-            Ok(output_path) => {
-                let output_path = output_path
-                    .strip_prefix(&self.output_root)
-                    .unwrap_or(&output_path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
+            Ok(artifacts) => {
                 info!(
                     ticket_id = ticket.id.as_str(),
-                    output_path = output_path.as_str(),
-                    "Executor generated modern source file"
+                    source_file_count = artifacts.source_files.len(),
+                    test_file_count = artifacts.test_files.len(),
+                    "Executor generated source and test artifacts"
                 );
 
                 updated_ticket.status = TicketStatus::InProgress;
-                updated_ticket.modern_file_paths = vec![output_path];
+                updated_ticket.modern_file_paths = artifacts.source_files;
+                updated_ticket.test_file_paths = artifacts.test_files;
                 Ok(updated_ticket)
             }
             Err(error) => {
@@ -254,6 +338,70 @@ impl Agent for ExecutorAgent {
             }
         }
     }
+}
+
+fn normalize_relative_path(path: &str) -> Result<String> {
+    normalize_portable_relative_path(path, "generated file path").map(|path| path.into_string())
+}
+
+fn determine_output_relative_path(ticket: &Ticket) -> Result<String> {
+    let default_filename = sanitize_for_filename(&ticket.id);
+    let source_relative_path = ticket
+        .context_files
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("generated/{default_filename}.txt"));
+    let source_path = Path::new(&source_relative_path);
+    let extension = target_extension(
+        &ticket.target_framework,
+        source_path.extension().and_then(|value| value.to_str()),
+    );
+    let file_stem = source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or(default_filename);
+
+    let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
+    let output_file_name = format!("{file_stem}.{extension}");
+
+    let output_path = if parent.as_os_str().is_empty() {
+        PathBuf::from(output_file_name)
+    } else {
+        parent.join(output_file_name)
+    };
+
+    normalize_relative_path(output_path.to_string_lossy().as_ref())
+}
+
+fn determine_test_output_relative_path(source_relative_path: &str) -> Result<String> {
+    let source_path = Path::new(source_relative_path);
+    let extension = source_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("txt");
+    let stem = source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("generated");
+    let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
+    let file_name = if extension == "go" {
+        format!("{stem}_test.{extension}")
+    } else if extension == "py" {
+        format!("test_{stem}.{extension}")
+    } else {
+        format!("{stem}.test.{extension}")
+    };
+
+    let relative_dir = if parent.as_os_str().is_empty() {
+        PathBuf::from("tests")
+    } else {
+        Path::new("tests").join(parent)
+    };
+
+    normalize_relative_path(relative_dir.join(file_name).to_string_lossy().as_ref())
 }
 
 fn target_extension(target_framework: &str, source_extension: Option<&str>) -> String {
@@ -318,31 +466,30 @@ fn sanitize_for_filename(value: &str) -> String {
     sanitized.trim_matches('-').to_owned()
 }
 
+fn file_array_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ExecutorAgent;
-    use crate::config::{LlmGateway, LlmProvider, TaskKind, TaskModelConfig};
-    use crate::skills::{FileIOSkill, FileWriteSkill};
-    use std::sync::Arc;
-
-    fn build_agent() -> ExecutorAgent {
-        ExecutorAgent::new(
-            "./legacy_app",
-            "./modern_app",
-            Arc::new(FileIOSkill),
-            Arc::new(FileWriteSkill),
-            LlmGateway::new().expect("gateway should build"),
-            TaskModelConfig::new(
-                TaskKind::Executor,
-                LlmProvider::OpenRouter,
-                ExecutorAgent::default_model(),
-            ),
-        )
-    }
+    use super::{
+        determine_output_relative_path, determine_test_output_relative_path,
+        normalize_relative_path,
+    };
 
     #[test]
     fn executor_maps_node_ticket_to_typescript_path() {
-        let agent = build_agent();
         let ticket = crate::agents::Ticket {
             id: "EXEC-1".to_owned(),
             description: "Migrate HTTP service".to_owned(),
@@ -352,31 +499,27 @@ mod tests {
             target_framework: "TypeScript".to_owned(),
             dependencies: vec!["express".to_owned()],
             modern_file_paths: Vec::new(),
+            test_file_paths: Vec::new(),
             retries: 0,
             token_usage: crate::agents::TicketTokenUsage::default(),
+            last_execution_diff: None,
+            last_ast_diff: None,
         };
 
-        let path = agent.determine_output_relative_path(&ticket);
+        let path = determine_output_relative_path(&ticket).expect("executor path should normalize");
         assert_eq!(path, "src/server.ts");
     }
 
     #[test]
-    fn executor_maps_go_ticket_to_go_path() {
-        let agent = build_agent();
-        let ticket = crate::agents::Ticket {
-            id: "EXEC-2".to_owned(),
-            description: "Migrate API".to_owned(),
-            context_files: vec!["services/api.js".to_owned()],
-            status: crate::agents::TicketStatus::Todo,
-            legacy_code_snippet: "app.get('/health')".to_owned(),
-            target_framework: "Go Fiber".to_owned(),
-            dependencies: vec!["fiber".to_owned()],
-            modern_file_paths: Vec::new(),
-            retries: 0,
-            token_usage: crate::agents::TicketTokenUsage::default(),
-        };
+    fn executor_derives_test_path_from_source_path() {
+        let path = determine_test_output_relative_path("src/server.ts")
+            .expect("executor test path should normalize");
+        assert_eq!(path, "tests/src/server.test.ts");
+    }
 
-        let path = agent.determine_output_relative_path(&ticket);
-        assert_eq!(path, "services/api.go");
+    #[test]
+    fn normalize_relative_path_rejects_parent_traversal() {
+        let error = normalize_relative_path("../secret.txt").expect_err("path should fail");
+        assert!(error.to_string().contains("traverse"));
     }
 }

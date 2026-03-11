@@ -1,40 +1,63 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::info;
+use zeroclaw::tools::ToolSpec;
 
-use crate::config::{LlmGateway, LlmProvider, TaskModelConfig};
+use crate::config::{TaskKind, ZeroClawClient};
 use crate::skills::Skill;
-use crate::utils::clean_json_response;
 
-use super::{Agent, Ticket};
+use super::{Agent, Ticket, TicketStatus, TicketTokenUsage};
 
 const BLUEPRINTER_NAME: &str = "blueprinter";
 const DEFAULT_BLUEPRINTER_MODEL: &str = "google/gemini-3-flash-preview";
 
 #[derive(Debug, Deserialize)]
-struct BlueprintEnvelope {
-    tickets: Vec<Ticket>,
+struct BlueprintPayload {
+    tickets: Vec<BlueprintTicket>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlueprintTicket {
+    id: String,
+    description: String,
+    context_files: Vec<String>,
+    legacy_code_snippet: String,
+    target_framework: String,
+    dependencies: Vec<String>,
+}
+
+impl From<BlueprintTicket> for Ticket {
+    fn from(value: BlueprintTicket) -> Self {
+        Self {
+            id: value.id,
+            description: value.description,
+            context_files: value.context_files,
+            status: TicketStatus::Todo,
+            legacy_code_snippet: value.legacy_code_snippet,
+            target_framework: value.target_framework,
+            dependencies: value.dependencies,
+            modern_file_paths: Vec::new(),
+            test_file_paths: Vec::new(),
+            retries: 0,
+            token_usage: TicketTokenUsage::default(),
+            last_execution_diff: None,
+            last_ast_diff: None,
+        }
+    }
 }
 
 pub struct BlueprinterAgent {
-    file_io_skill: Arc<dyn Skill>,
-    route: TaskModelConfig,
-    llm_gateway: LlmGateway,
+    ast_parsing_skill: Arc<dyn Skill>,
+    llm_client: Arc<ZeroClawClient>,
 }
 
 impl BlueprinterAgent {
-    pub fn new(
-        file_io_skill: Arc<dyn Skill>,
-        llm_gateway: LlmGateway,
-        route: TaskModelConfig,
-    ) -> Self {
+    pub fn new(ast_parsing_skill: Arc<dyn Skill>, llm_client: Arc<ZeroClawClient>) -> Self {
         Self {
-            file_io_skill,
-            route,
-            llm_gateway,
+            ast_parsing_skill,
+            llm_client,
         }
     }
 
@@ -42,108 +65,126 @@ impl BlueprinterAgent {
         DEFAULT_BLUEPRINTER_MODEL
     }
 
-    pub fn provider(&self) -> LlmProvider {
-        self.route.provider
+    pub fn provider(&self) -> &'static str {
+        self.llm_client.provider_name()
     }
 
     pub async fn generate_blueprint(&self, legacy_dir_path: &str) -> Result<Vec<Ticket>> {
-        let codebase_snapshot = self
-            .file_io_skill
+        let dependency_graph = self
+            .ast_parsing_skill
             .execute(vec![legacy_dir_path.to_owned()])
+            .await
             .with_context(|| {
-                format!("failed to build codebase snapshot from legacy directory {legacy_dir_path}")
+                format!(
+                    "failed to build AST dependency graph from legacy directory {legacy_dir_path}"
+                )
             })?;
 
         info!(
             legacy_dir_path,
-            bytes = codebase_snapshot.len(),
-            "Collected legacy codebase snapshot"
+            bytes = dependency_graph.len(),
+            "Collected legacy codebase dependency graph"
         );
 
-        let response = self
-            .llm_gateway
-            .chat_completion(
-                &self.route,
+        let structured_call = self
+            .llm_client
+            .chat_with_schema(
+                TaskKind::Blueprinter,
                 &self.system_prompt(),
-                &self.user_prompt(legacy_dir_path, &codebase_snapshot),
+                &self.user_prompt(legacy_dir_path, &dependency_graph),
+                self.blueprint_tool(),
             )
             .await
             .context("blueprint generation failed")?;
-        let (response, usage) = response;
         info!(
-            model = self.route.model.as_str(),
-            prompt_tokens = usage.prompt_tokens,
-            completion_tokens = usage.completion_tokens,
-            total_tokens = usage.total_tokens,
+            model = self.model(),
+            prompt_tokens = structured_call.usage.prompt_tokens,
+            completion_tokens = structured_call.usage.completion_tokens,
+            total_tokens = structured_call.usage.total_tokens,
             "Blueprinter token usage"
         );
 
-        self.parse_blueprint_response(&response)
+        let payload: BlueprintPayload = structured_call.deserialize_arguments()?;
+        Ok(payload.tickets.into_iter().map(Ticket::from).collect())
     }
 
     fn system_prompt(&self) -> String {
-        format!(concat!(
+        concat!(
             "You are a Staff Software Engineer specializing in large-scale legacy migrations.\n",
-            "Your task is to analyze a legacy codebase snapshot and produce an industrial-grade migration blueprint.\n",
-            "Return only strict JSON. Do not include markdown fences, comments, or explanatory prose.\n",
-            "The JSON must either be an object with a top-level `tickets` array or a raw array of ticket objects.\n",
-            "Each ticket object must match this schema exactly:\n",
-            "{{",
-            "\"id\":\"BP-001\",",
-            "\"description\":\"Short actionable migration task.\",",
-            "\"context_files\":[\"relative/path.ext\"],",
-            "\"status\":\"Todo\",",
-            "\"legacy_code_snippet\":\"short verbatim snippet from the legacy codebase\",",
-            "\"target_framework\":\"recommended modern framework or runtime\",",
-            "\"dependencies\":[\"package-or-library\"]",
-            "}}\n",
+            "Analyze the provided legacy codebase dependency graph and generate an industrial-grade migration blueprint.\n",
+            "You must respond by calling the provided tool exactly once.\n",
             "Rules:\n",
             "1. Preserve semantic equivalence and operational behavior.\n",
             "2. Break work into independently executable tickets.\n",
-            "3. Use only relative file paths that actually exist in the supplied snapshot.\n",
-            "4. `legacy_code_snippet` must be copied from the snapshot, shortened if needed.\n",
-            "5. `status` must always be `Todo`.\n",
-            "6. `target_framework` should be the best-fit modern destination for that ticket.\n",
-            "7. `dependencies` should list concrete libraries, frameworks, or runtime dependencies.\n",
-            "8. If the snapshot is too small for certainty, make the most conservative inference possible.\n"
-        ))
+            "3. Use only relative file paths that actually exist in the supplied dependency graph.\n",
+            "4. `legacy_code_snippet` must be a concise structural summary inferred from the graph, not raw source text.\n",
+            "5. `target_framework` should be the best-fit modern destination for that ticket.\n",
+            "6. `dependencies` should list concrete libraries, frameworks, or runtime dependencies.\n",
+            "7. Do not emit markdown fences, plain text, or explanations.\n"
+        )
+        .to_owned()
     }
 
-    fn user_prompt(&self, legacy_dir_path: &str, codebase_snapshot: &str) -> String {
+    fn user_prompt(&self, legacy_dir_path: &str, dependency_graph: &str) -> String {
         format!(
-            "Analyze the legacy codebase below and create a migration blueprint.\n\
+            "Analyze the legacy codebase dependency graph below and create a migration blueprint.\n\
 Legacy directory: {legacy_dir_path}\n\
-Codebase snapshot:\n\
-{codebase_snapshot}\n"
+Dependency graph JSON:\n\
+{dependency_graph}\n"
         )
     }
 
-    fn parse_blueprint_response(&self, raw_response: &str) -> Result<Vec<Ticket>> {
-        let cleaned = clean_json_response(raw_response);
-
-        if let Ok(envelope) = serde_json::from_str::<BlueprintEnvelope>(&cleaned) {
-            return Ok(envelope.tickets);
+    fn blueprint_tool(&self) -> ToolSpec {
+        ToolSpec {
+            name: "submit_blueprint".to_owned(),
+            description: "Return the migration blueprint tickets".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tickets": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "description": { "type": "string" },
+                                "context_files": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                },
+                                "legacy_code_snippet": { "type": "string" },
+                                "target_framework": { "type": "string" },
+                                "dependencies": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                }
+                            },
+                            "required": [
+                                "id",
+                                "description",
+                                "context_files",
+                                "legacy_code_snippet",
+                                "target_framework",
+                                "dependencies"
+                            ],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["tickets"],
+                "additionalProperties": false
+            }),
         }
-
-        if let Ok(tickets) = serde_json::from_str::<Vec<Ticket>>(&cleaned) {
-            return Ok(tickets);
-        }
-
-        Err(anyhow!(
-            "failed to parse blueprinter response as JSON tickets: {}",
-            truncate_for_error(&cleaned)
-        ))
     }
 }
 
-#[async_trait]
 impl Agent for BlueprinterAgent {
     fn name(&self) -> &str {
         BLUEPRINTER_NAME
     }
 
     fn model(&self) -> &str {
-        &self.route.model
+        self.llm_client.model_for(TaskKind::Blueprinter)
     }
 
     async fn process_ticket(&self, _ticket: &Ticket) -> Result<Ticket> {
@@ -153,86 +194,33 @@ impl Agent for BlueprinterAgent {
     }
 }
 
-fn truncate_for_error(value: &str) -> String {
-    const MAX_LEN: usize = 500;
-
-    if value.len() <= MAX_LEN {
-        value.to_owned()
-    } else {
-        format!("{}...", &value[..MAX_LEN])
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::BlueprinterAgent;
-    use crate::agents::{Ticket, TicketStatus, TicketTokenUsage};
-    use crate::config::{LlmGateway, LlmProvider, TaskKind, TaskModelConfig};
-    use crate::skills::FileIOSkill;
-    use std::sync::Arc;
-
-    fn build_agent() -> BlueprinterAgent {
-        BlueprinterAgent::new(
-            Arc::new(FileIOSkill),
-            LlmGateway::new().expect("gateway should build"),
-            TaskModelConfig::new(
-                TaskKind::Blueprinter,
-                LlmProvider::OpenRouter,
-                BlueprinterAgent::default_model(),
-            ),
-        )
-    }
+    use super::{BlueprintPayload, BlueprintTicket};
+    use crate::agents::{Ticket, TicketStatus};
 
     #[test]
-    fn blueprinter_parses_ticket_envelope() {
-        let agent = build_agent();
-        let raw = r#"```json
-        {
-          "tickets": [
-            {
-              "id": "BP-001",
-              "description": "Migrate HTTP endpoint",
-              "context_files": ["server.js"],
-              "status": "Todo",
-              "legacy_code_snippet": "http.createServer(...)",
-              "target_framework": "Express.js",
-              "dependencies": ["express"]
-            }
-          ]
-        }
-        ```"#;
+    fn blueprint_ticket_conversion_defaults_runtime_fields() {
+        let payload = BlueprintPayload {
+            tickets: vec![BlueprintTicket {
+                id: "BP-001".to_owned(),
+                description: "Migrate HTTP endpoint".to_owned(),
+                context_files: vec!["server.js".to_owned()],
+                legacy_code_snippet: "http.createServer(...)".to_owned(),
+                target_framework: "Express.js".to_owned(),
+                dependencies: vec!["express".to_owned()],
+            }],
+        };
 
-        let tickets = agent
-            .parse_blueprint_response(raw)
-            .expect("response should parse");
+        let tickets = payload
+            .tickets
+            .into_iter()
+            .map(Ticket::from)
+            .collect::<Vec<_>>();
 
         assert_eq!(tickets.len(), 1);
         assert_eq!(tickets[0].status, TicketStatus::Todo);
-        assert_eq!(tickets[0].id, "BP-001");
-    }
-
-    #[test]
-    fn blueprinter_parses_raw_ticket_array() {
-        let agent = build_agent();
-        let raw = serde_json::to_string(&vec![Ticket {
-            id: "BP-002".to_owned(),
-            description: "Migrate persistence".to_owned(),
-            context_files: vec!["db.js".to_owned()],
-            status: TicketStatus::Todo,
-            legacy_code_snippet: "function loadCustomer(id) {}".to_owned(),
-            target_framework: "Prisma".to_owned(),
-            dependencies: vec!["prisma".to_owned()],
-            modern_file_paths: Vec::new(),
-            retries: 0,
-            token_usage: TicketTokenUsage::default(),
-        }])
-        .expect("tickets should serialize");
-
-        let tickets = agent
-            .parse_blueprint_response(&raw)
-            .expect("response should parse");
-
-        assert_eq!(tickets.len(), 1);
-        assert_eq!(tickets[0].target_framework, "Prisma");
+        assert!(tickets[0].modern_file_paths.is_empty());
+        assert_eq!(tickets[0].retries, 0);
     }
 }

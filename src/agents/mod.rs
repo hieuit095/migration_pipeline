@@ -1,8 +1,8 @@
 use anyhow::Result;
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::config::TokenUsage;
+use crate::config::ProjectTokenUsage;
+use crate::skills::{AstDiff, ExecutionDiff};
 
 mod blueprinter;
 mod executor;
@@ -26,9 +26,15 @@ pub struct Ticket {
     #[serde(default)]
     pub modern_file_paths: Vec<String>,
     #[serde(default)]
+    pub test_file_paths: Vec<String>,
+    #[serde(default)]
     pub retries: u8,
     #[serde(default)]
     pub token_usage: TicketTokenUsage,
+    #[serde(default)]
+    pub last_execution_diff: Option<ExecutionDiff>,
+    #[serde(default)]
+    pub last_ast_diff: Option<AstDiff>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -47,7 +53,6 @@ pub enum TicketStatus {
     Failed(String),
 }
 
-#[async_trait]
 pub trait Agent: Send + Sync {
     fn name(&self) -> &str;
     fn model(&self) -> &str;
@@ -55,19 +60,19 @@ pub trait Agent: Send + Sync {
 }
 
 impl Ticket {
-    pub fn record_llm_usage(&mut self, usage: &TokenUsage) {
+    pub fn record_llm_usage(&mut self, usage: &ProjectTokenUsage) {
         self.token_usage.llm_calls = self.token_usage.llm_calls.saturating_add(1);
         self.token_usage.prompt_tokens = self
             .token_usage
             .prompt_tokens
-            .saturating_add(u64::from(usage.prompt_tokens));
+            .saturating_add(usage.prompt_tokens);
         self.token_usage.completion_tokens = self
             .token_usage
             .completion_tokens
-            .saturating_add(u64::from(usage.completion_tokens));
+            .saturating_add(usage.completion_tokens);
         self.token_usage.total_tokens = self
             .token_usage
             .total_tokens
-            .saturating_add(u64::from(usage.total_tokens));
+            .saturating_add(usage.total_tokens);
     }
 }

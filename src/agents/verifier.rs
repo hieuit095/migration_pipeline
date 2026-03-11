@@ -1,55 +1,52 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, ensure};
-use async_trait::async_trait;
-use serde::Deserialize;
-use tracing::{error, info};
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+use tracing::{error, info, warn};
+use zeroclaw::tools::ToolSpec;
 
-use crate::config::{LlmGateway, LlmProvider, TaskModelConfig};
-use crate::skills::{Skill, TerminalCommandOutput};
-use crate::utils::clean_json_response;
+use crate::config::{TaskKind, ZeroClawClient};
+use crate::skills::{
+    AstDiff, ExecutionDiff, ExecutionTarget, ShadowFixture, ShadowTestRequest, Skill,
+    diff_dependency_graphs, parse_dependency_graph_json,
+};
+use crate::utils::path::normalize_relative_path as normalize_portable_relative_path;
 
 use super::{Agent, Ticket, TicketStatus};
 
 const VERIFIER_NAME: &str = "verifier";
 const DEFAULT_VERIFIER_MODEL: &str = "z-ai/glm-5";
 
-#[derive(Debug, Deserialize)]
-struct VerificationReport {
-    is_semantically_equivalent: bool,
-    syntax_or_logic_issues: Vec<String>,
-    generated_test_code: String,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ShadowFixturePlan {
+    legacy_target: ExecutionTarget,
+    modern_target: ExecutionTarget,
+    fixtures: Vec<ShadowFixture>,
 }
 
 pub struct VerifierAgent {
     legacy_root: PathBuf,
     modern_root: PathBuf,
-    file_io_skill: Arc<dyn Skill>,
-    file_write_skill: Arc<dyn Skill>,
-    sandbox_skill: Arc<dyn Skill>,
-    route: TaskModelConfig,
-    llm_gateway: LlmGateway,
+    ast_parsing_skill: Arc<dyn Skill>,
+    shadow_test_skill: Arc<dyn Skill>,
+    llm_client: Arc<ZeroClawClient>,
 }
 
 impl VerifierAgent {
     pub fn new(
         legacy_root: impl Into<PathBuf>,
         modern_root: impl Into<PathBuf>,
-        file_io_skill: Arc<dyn Skill>,
-        file_write_skill: Arc<dyn Skill>,
-        sandbox_skill: Arc<dyn Skill>,
-        llm_gateway: LlmGateway,
-        route: TaskModelConfig,
+        ast_parsing_skill: Arc<dyn Skill>,
+        shadow_test_skill: Arc<dyn Skill>,
+        llm_client: Arc<ZeroClawClient>,
     ) -> Self {
         Self {
             legacy_root: legacy_root.into(),
             modern_root: modern_root.into(),
-            file_io_skill,
-            file_write_skill,
-            sandbox_skill,
-            route,
-            llm_gateway,
+            ast_parsing_skill,
+            shadow_test_skill,
+            llm_client,
         }
     }
 
@@ -57,249 +54,228 @@ impl VerifierAgent {
         DEFAULT_VERIFIER_MODEL
     }
 
-    pub fn provider(&self) -> LlmProvider {
-        self.route.provider
+    pub fn provider(&self) -> &'static str {
+        self.llm_client.provider_name()
     }
 
     async fn verify_ticket(&self, ticket: &mut Ticket) -> Result<Ticket> {
         ensure!(
+            !ticket.context_files.is_empty(),
+            "ticket {} does not provide legacy context files for semantic verification",
+            ticket.id
+        );
+        ensure!(
             !ticket.modern_file_paths.is_empty(),
-            "ticket {} does not have any generated modern file paths to verify",
+            "ticket {} does not have any generated source files to verify",
             ticket.id
         );
 
-        let legacy_context = self
-            .read_files(&self.legacy_root, &ticket.context_files)
-            .with_context(|| format!("failed to read legacy context for ticket {}", ticket.id))?;
-        let modern_context = self
-            .read_files(&self.modern_root, &ticket.modern_file_paths)
-            .with_context(|| format!("failed to read modern context for ticket {}", ticket.id))?;
+        let legacy_graph_json = self
+            .build_dependency_graph(&self.legacy_root, &ticket.context_files)
+            .await
+            .with_context(|| {
+                format!("failed to build legacy AST graph for ticket {}", ticket.id)
+            })?;
+        let legacy_graph = parse_dependency_graph_json(&legacy_graph_json)?;
 
-        let response = self
-            .llm_gateway
-            .chat_completion(
-                &self.route,
+        let modern_graph_result = self
+            .build_dependency_graph(&self.modern_root, &ticket.modern_file_paths)
+            .await;
+        let (modern_graph_json, ast_diff) = match modern_graph_result {
+            Ok(graph_json) => {
+                let modern_graph = parse_dependency_graph_json(&graph_json)?;
+                (
+                    Some(graph_json),
+                    diff_dependency_graphs(&legacy_graph, &modern_graph),
+                )
+            }
+            Err(error) => {
+                warn!(
+                    ticket_id = ticket.id.as_str(),
+                    error = %error,
+                    "Verifier could not build a modern AST graph; falling back to execution-only diffing"
+                );
+                (
+                    None,
+                    AstDiff {
+                        unsupported_files: ticket.modern_file_paths.clone(),
+                        notes: vec![error.to_string()],
+                        ..AstDiff::default()
+                    },
+                )
+            }
+        };
+
+        let structured_call = self
+            .llm_client
+            .chat_with_schema(
+                TaskKind::Verifier,
                 &self.system_prompt(ticket),
-                &self.user_prompt(ticket, &legacy_context, &modern_context),
+                &self.user_prompt(ticket, &legacy_graph_json, modern_graph_json.as_deref()),
+                self.generate_shadow_fixtures_tool(),
             )
             .await
             .with_context(|| format!("verifier model failed for ticket {}", ticket.id))?;
-        let (response, usage) = response;
         info!(
             ticket_id = ticket.id.as_str(),
-            model = self.route.model.as_str(),
-            prompt_tokens = usage.prompt_tokens,
-            completion_tokens = usage.completion_tokens,
-            total_tokens = usage.total_tokens,
+            model = self.model(),
+            prompt_tokens = structured_call.usage.prompt_tokens,
+            completion_tokens = structured_call.usage.completion_tokens,
+            total_tokens = structured_call.usage.total_tokens,
             "Verifier token usage"
         );
-        ticket.record_llm_usage(&usage);
-        let report = self
-            .parse_report(&response)
-            .with_context(|| format!("failed to parse verifier report for ticket {}", ticket.id))?;
+        ticket.record_llm_usage(&structured_call.usage);
 
-        if !report.is_semantically_equivalent || !report.syntax_or_logic_issues.is_empty() {
-            let failure_reason = if report.syntax_or_logic_issues.is_empty() {
-                "semantic equivalence check failed".to_owned()
-            } else {
-                report.syntax_or_logic_issues.join(", ")
-            };
+        let plan: ShadowFixturePlan = structured_call.deserialize_arguments()?;
+        validate_shadow_plan(ticket, &plan)?;
+        let execution_diff = self.execute_shadow_tests(ticket, &plan).await?;
 
-            error!(
+        ticket.last_execution_diff = Some(execution_diff.clone());
+        ticket.last_ast_diff = Some(ast_diff.clone());
+
+        if execution_diff.equivalent {
+            info!(
                 ticket_id = ticket.id.as_str(),
-                issues = failure_reason.as_str(),
-                "Verifier rejected generated code"
+                fixture_count = execution_diff.fixture_diffs.len(),
+                "Verifier accepted generated code after shadow testing"
             );
-
-            ticket.status = TicketStatus::Failed(failure_reason);
+            ticket.status = TicketStatus::Verified;
             return Ok(ticket.clone());
         }
 
-        ensure!(
-            !report.generated_test_code.trim().is_empty(),
-            "verifier returned empty generated_test_code for ticket {}",
-            ticket.id
-        );
-
-        let test_relative_path = self.determine_test_relative_path(ticket)?;
-        let test_output_path = self.modern_root.join(&test_relative_path);
-        self.file_write_skill
-            .execute(vec![
-                test_output_path.to_string_lossy().into_owned(),
-                report.generated_test_code,
-            ])
-            .with_context(|| {
-                format!(
-                    "failed to write generated test file for ticket {}",
-                    ticket.id
-                )
-            })?;
-
-        for modern_file in &ticket.modern_file_paths {
-            self.run_syntax_check(modern_file)
-                .with_context(|| format!("syntax check failed for modern file `{modern_file}`"))?;
-        }
-        self.run_syntax_check(&test_relative_path)
-            .with_context(|| {
-                format!("syntax check failed for verifier test `{test_relative_path}`")
-            })?;
-
-        info!(
+        let failure_reason = build_failure_summary(&execution_diff, &ast_diff);
+        error!(
             ticket_id = ticket.id.as_str(),
-            test_path = test_relative_path.as_str(),
-            "Verifier accepted generated code and test"
+            failure = failure_reason.as_str(),
+            "Verifier rejected generated artifacts after semantic shadow testing"
         );
-
-        ticket.status = TicketStatus::Verified;
+        ticket.status = TicketStatus::Failed(failure_reason);
         Ok(ticket.clone())
     }
 
-    fn read_files(&self, root: &Path, relative_paths: &[String]) -> Result<String> {
-        ensure!(
-            !relative_paths.is_empty(),
-            "no relative paths provided for file read from {}",
-            root.display()
-        );
-
+    async fn build_dependency_graph(
+        &self,
+        root: &Path,
+        relative_paths: &[String],
+    ) -> Result<String> {
         let mut args = vec![root.to_string_lossy().into_owned()];
         args.extend(relative_paths.iter().cloned());
-        self.file_io_skill.execute(args)
+        self.ast_parsing_skill.execute(args).await
+    }
+
+    async fn execute_shadow_tests(
+        &self,
+        ticket: &Ticket,
+        plan: &ShadowFixturePlan,
+    ) -> Result<ExecutionDiff> {
+        let request = ShadowTestRequest {
+            legacy_root: self.legacy_root.to_string_lossy().into_owned(),
+            modern_root: self.modern_root.to_string_lossy().into_owned(),
+            legacy_target: plan.legacy_target.clone(),
+            modern_target: plan.modern_target.clone(),
+            fixtures: plan.fixtures.clone(),
+        };
+        let payload = serde_json::to_string(&request).with_context(|| {
+            format!(
+                "failed to serialize shadow request for ticket {}",
+                ticket.id
+            )
+        })?;
+        let raw_diff = self
+            .shadow_test_skill
+            .execute(vec![payload])
+            .await
+            .with_context(|| format!("shadow test execution failed for ticket {}", ticket.id))?;
+        serde_json::from_str(&raw_diff).context("failed to deserialize shadow execution diff")
     }
 
     fn system_prompt(&self, ticket: &Ticket) -> String {
         format!(
             concat!(
-                "You are a Staff Verification Engineer specializing in semantic validation for {framework} migrations.\n",
-                "Compare the legacy implementation against the generated modern implementation.\n",
-                "Return only strict JSON matching this exact schema:\n",
-                "{{",
-                "\"is_semantically_equivalent\": true,",
-                "\"syntax_or_logic_issues\": [\"issue if any\"],",
-                "\"generated_test_code\": \"test code as a JSON string\"",
-                "}}\n",
+                "You are an uncompromising semantic equivalence judge for {framework} migrations.\n",
+                "Your task is to design shadow-test fixtures that prove whether the modern implementation matches the legacy behavior.\n",
+                "You must respond by calling the provided tool exactly once.\n",
                 "Rules:\n",
-                "1. No markdown fences.\n",
-                "2. No prose outside the JSON object.\n",
-                "3. `syntax_or_logic_issues` must be an array of concrete findings.\n",
-                "4. `generated_test_code` must contain only compile-ready unit test source code.\n",
-                "5. If there is any semantic mismatch, set `is_semantically_equivalent` to false.\n"
+                "1. Select one callable entry point from the supplied legacy files and one callable entry point from the supplied modern files.\n",
+                "2. Generate JSON fixtures that stress happy paths, boundary values, nullability, malformed inputs, and branch-heavy edge cases.\n",
+                "3. Every fixture must use positional `args` only.\n",
+                "4. Prefer fixtures that exercise every branch visible in the legacy AST.\n",
+                "5. Use only the file paths explicitly provided in the prompt.\n",
+                "6. Do not emit prose, markdown, or explanations.\n"
             ),
             framework = ticket.target_framework
         )
     }
 
-    fn user_prompt(&self, ticket: &Ticket, legacy_context: &str, modern_context: &str) -> String {
+    fn user_prompt(
+        &self,
+        ticket: &Ticket,
+        legacy_graph_json: &str,
+        modern_graph_json: Option<&str>,
+    ) -> String {
+        let modern_graph_section = modern_graph_json.unwrap_or(
+            "{\"warning\":\"modern AST unavailable; choose from the provided modern files only\"}",
+        );
         format!(
             concat!(
                 "Ticket ID: {ticket_id}\n",
                 "Description: {description}\n",
-                "Target framework: {target_framework}\n",
                 "Legacy files: {legacy_files}\n",
                 "Modern files: {modern_files}\n",
-                "Legacy code:\n",
-                "{legacy_context}\n\n",
-                "Modern code:\n",
-                "{modern_context}\n"
+                "Legacy AST graph JSON:\n",
+                "{legacy_graph_json}\n\n",
+                "Modern AST graph JSON:\n",
+                "{modern_graph_json}\n"
             ),
             ticket_id = ticket.id,
             description = ticket.description,
-            target_framework = ticket.target_framework,
             legacy_files = ticket.context_files.join(", "),
             modern_files = ticket.modern_file_paths.join(", "),
-            legacy_context = legacy_context,
-            modern_context = modern_context
+            legacy_graph_json = legacy_graph_json,
+            modern_graph_json = modern_graph_section
         )
     }
 
-    fn parse_report(&self, raw_response: &str) -> Result<VerificationReport> {
-        let cleaned = clean_json_response(raw_response);
-        serde_json::from_str::<VerificationReport>(&cleaned).with_context(|| {
-            format!(
-                "invalid verifier JSON payload: {}",
-                truncate_for_error(&cleaned)
-            )
-        })
-    }
-
-    fn determine_test_relative_path(&self, ticket: &Ticket) -> Result<String> {
-        let first_modern_file = ticket
-            .modern_file_paths
-            .first()
-            .context("ticket does not contain modern file paths for test generation")?;
-        let modern_path = Path::new(first_modern_file);
-        let extension = modern_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("txt");
-        let stem = modern_path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or("generated");
-        let parent = modern_path.parent().unwrap_or_else(|| Path::new(""));
-        let file_name = if extension == "go" {
-            format!("{stem}_test.{extension}")
-        } else if extension == "py" {
-            format!("test_{stem}.{extension}")
-        } else {
-            format!("{stem}.test.{extension}")
-        };
-
-        let relative_dir = if parent.as_os_str().is_empty() {
-            PathBuf::from("tests")
-        } else {
-            Path::new("tests").join(parent)
-        };
-
-        Ok(relative_dir
-            .join(file_name)
-            .to_string_lossy()
-            .replace('\\', "/"))
-    }
-
-    fn run_syntax_check(&self, relative_path: &str) -> Result<()> {
-        let full_path = self.modern_root.join(relative_path);
-        let result = self
-            .sandbox_skill
-            .execute(vec![
-                self.modern_root.to_string_lossy().into_owned(),
-                relative_path.to_owned(),
-            ])
-            .with_context(|| format!("sandbox execution failed for {}", full_path.display()))?;
-        let output: TerminalCommandOutput =
-            serde_json::from_str(&result).context("failed to parse sandbox output payload")?;
-
-        if output.exit_code != 0 {
-            let failure_output = if output.stderr.trim().is_empty() {
-                output.stdout
-            } else {
-                output.stderr
-            };
-            return Err(anyhow!(
-                "syntax check failed for {} using `{}`: {}",
-                relative_path,
-                output.command,
-                failure_output.trim()
-            ));
+    fn generate_shadow_fixtures_tool(&self) -> ToolSpec {
+        ToolSpec {
+            name: "generate_shadow_fixtures".to_owned(),
+            description: "Select matching execution entry points and generate exhaustive JSON fixtures for semantic shadow testing".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "legacy_target": execution_target_schema(),
+                    "modern_target": execution_target_schema(),
+                    "fixtures": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "description": { "type": "string" },
+                                "args": {
+                                    "type": "array",
+                                    "items": {}
+                                }
+                            },
+                            "required": ["id", "description", "args"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["legacy_target", "modern_target", "fixtures"],
+                "additionalProperties": false
+            }),
         }
-
-        info!(
-            file = relative_path,
-            command = output.command.as_str(),
-            "Sandboxed syntax check completed"
-        );
-        Ok(())
     }
 }
 
-#[async_trait]
 impl Agent for VerifierAgent {
     fn name(&self) -> &str {
         VERIFIER_NAME
     }
 
     fn model(&self) -> &str {
-        &self.route.model
+        self.llm_client.model_for(TaskKind::Verifier)
     }
 
     async fn process_ticket(&self, ticket: &Ticket) -> Result<Ticket> {
@@ -322,79 +298,133 @@ impl Agent for VerifierAgent {
     }
 }
 
-fn truncate_for_error(value: &str) -> String {
-    const MAX_LEN: usize = 500;
+fn validate_shadow_plan(ticket: &Ticket, plan: &ShadowFixturePlan) -> Result<()> {
+    let normalized_legacy_target = normalize_relative_path(&plan.legacy_target.relative_path)
+        .with_context(|| "verifier returned an invalid legacy target path")?;
+    let normalized_modern_target = normalize_relative_path(&plan.modern_target.relative_path)
+        .with_context(|| "verifier returned an invalid modern target path")?;
 
-    if value.len() <= MAX_LEN {
-        value.to_owned()
-    } else {
-        format!("{}...", &value[..MAX_LEN])
+    ensure!(
+        !plan.fixtures.is_empty(),
+        "verifier returned no shadow fixtures for ticket {}",
+        ticket.id
+    );
+    ensure!(
+        ticket
+            .context_files
+            .iter()
+            .any(|path| normalize_relative_path(path).ok().as_deref()
+                == Some(normalized_legacy_target.as_str())),
+        "verifier selected legacy target `{}` outside the allowed context files for ticket {}",
+        plan.legacy_target.relative_path,
+        ticket.id
+    );
+    ensure!(
+        ticket
+            .modern_file_paths
+            .iter()
+            .any(|path| normalize_relative_path(path).ok().as_deref()
+                == Some(normalized_modern_target.as_str())),
+        "verifier selected modern target `{}` outside the allowed modern files for ticket {}",
+        plan.modern_target.relative_path,
+        ticket.id
+    );
+    Ok(())
+}
+
+fn execution_target_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "relative_path": { "type": "string" },
+            "callable": { "type": "string" }
+        },
+        "required": ["relative_path", "callable"],
+        "additionalProperties": false
+    })
+}
+
+fn build_failure_summary(execution_diff: &ExecutionDiff, ast_diff: &AstDiff) -> String {
+    let mut details = execution_diff
+        .fixture_diffs
+        .iter()
+        .flat_map(|fixture_diff| fixture_diff.differences.iter().cloned())
+        .take(5)
+        .collect::<Vec<_>>();
+    details.extend(
+        execution_diff
+            .sandbox_execution_errors
+            .iter()
+            .take(5)
+            .cloned(),
+    );
+    if !ast_diff.is_empty() {
+        details.push(format!(
+            "ast_diff: missing_functions={}, missing_classes={}, missing_imports={}, missing_branches={}",
+            ast_diff.missing_functions.len(),
+            ast_diff.missing_classes.len(),
+            ast_diff.missing_imports.len(),
+            ast_diff.missing_branches.len()
+        ));
     }
+
+    if details.is_empty() {
+        "semantic shadow testing failed without a detailed diff".to_owned()
+    } else {
+        details.join(" | ")
+    }
+}
+
+fn normalize_relative_path(path: &str) -> Result<String> {
+    normalize_portable_relative_path(path, "file path").map(|path| path.into_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::VerifierAgent;
-    use crate::agents::{Ticket, TicketStatus};
-    use crate::config::{LlmGateway, LlmProvider, TaskKind, TaskModelConfig};
-    use crate::skills::{FileIOSkill, FileWriteSkill, SandboxSkill};
-    use std::sync::Arc;
-
-    fn build_agent() -> VerifierAgent {
-        VerifierAgent::new(
-            "./legacy_app",
-            "./modern_app",
-            Arc::new(FileIOSkill),
-            Arc::new(FileWriteSkill),
-            Arc::new(SandboxSkill),
-            LlmGateway::new().expect("gateway should build"),
-            TaskModelConfig::new(
-                TaskKind::Verifier,
-                LlmProvider::OpenRouter,
-                VerifierAgent::default_model(),
-            ),
-        )
-    }
+    use super::{ShadowFixturePlan, build_failure_summary};
+    use crate::skills::{AstDiff, ExecutionDiff, ExecutionTarget, ShadowFixture};
 
     #[test]
-    fn verifier_parses_valid_json_report() {
-        let agent = build_agent();
-        let report = agent
-            .parse_report(
-                r#"```json
-                {
-                    "is_semantically_equivalent": true,
-                    "syntax_or_logic_issues": [],
-                    "generated_test_code": "export const ok = true;"
-                }
-                ```"#,
-            )
-            .expect("report should parse");
-
-        assert!(report.is_semantically_equivalent);
-        assert!(report.syntax_or_logic_issues.is_empty());
-    }
-
-    #[test]
-    fn verifier_builds_test_path_from_modern_file() {
-        let agent = build_agent();
-        let ticket = Ticket {
-            id: "VERIFY-1".to_owned(),
-            description: "Verify translation".to_owned(),
-            context_files: vec!["src/server.js".to_owned()],
-            status: TicketStatus::InProgress,
-            legacy_code_snippet: "http.createServer(...)".to_owned(),
-            target_framework: "TypeScript".to_owned(),
-            dependencies: vec!["express".to_owned()],
-            modern_file_paths: vec!["src/server.ts".to_owned()],
-            retries: 0,
-            token_usage: crate::agents::TicketTokenUsage::default(),
+    fn shadow_fixture_plan_round_trips() {
+        let plan = ShadowFixturePlan {
+            legacy_target: ExecutionTarget {
+                relative_path: "src/server.js".to_owned(),
+                callable: "bootstrap".to_owned(),
+            },
+            modern_target: ExecutionTarget {
+                relative_path: "src/server.ts".to_owned(),
+                callable: "bootstrap".to_owned(),
+            },
+            fixtures: vec![ShadowFixture {
+                id: "edge-null".to_owned(),
+                description: "null input".to_owned(),
+                args: vec![serde_json::json!(null)],
+            }],
         };
 
-        let path = agent
-            .determine_test_relative_path(&ticket)
-            .expect("test path should be derived");
+        let value = serde_json::to_value(&plan).expect("plan should serialize");
+        assert_eq!(value["fixtures"][0]["id"], "edge-null");
+    }
 
-        assert_eq!(path, "tests/src/server.test.ts");
+    #[test]
+    fn failure_summary_includes_execution_and_ast_signals() {
+        let execution_diff = ExecutionDiff {
+            equivalent: false,
+            fixture_diffs: Vec::new(),
+            sandbox_execution_errors: vec!["fixture `fx-1` return value mismatch".to_owned()],
+        };
+        let _fixture = ShadowFixture {
+            id: "fx-1".to_owned(),
+            description: "basic".to_owned(),
+            args: Vec::new(),
+        };
+        let ast_diff = AstDiff {
+            missing_branches: vec!["src/server.js::if::port > 0".to_owned()],
+            ..AstDiff::default()
+        };
+
+        let summary = build_failure_summary(&execution_diff, &ast_diff);
+        assert!(summary.contains("return value mismatch"));
+        assert!(summary.contains("ast_diff"));
     }
 }

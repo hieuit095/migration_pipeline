@@ -1,26 +1,38 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use async_trait::async_trait;
+use serde::Deserialize;
 use tracing::{info, warn};
+use zeroclaw::tools::ToolSpec;
 
-use crate::config::{LlmGateway, LlmProvider, TaskModelConfig};
+use crate::config::{TaskKind, ZeroClawClient};
 use crate::skills::Skill;
-use crate::utils::clean_code_response;
+use crate::utils::path::normalize_relative_path as normalize_portable_relative_path;
 
 use super::{Agent, Ticket, TicketStatus};
 
 const SURGEON_NAME: &str = "surgeon";
 const DEFAULT_SURGEON_MODEL: &str = "anthropic/claude-3.5-sonnet";
 
+#[derive(Debug, Deserialize)]
+struct FixedFilesPayload {
+    files: Vec<FixedFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixedFile {
+    path: String,
+    content: String,
+}
+
 pub struct SurgeonAgent {
     legacy_root: PathBuf,
     modern_root: PathBuf,
     file_io_skill: Arc<dyn Skill>,
     file_write_skill: Arc<dyn Skill>,
-    route: TaskModelConfig,
-    llm_gateway: LlmGateway,
+    llm_client: Arc<ZeroClawClient>,
 }
 
 impl SurgeonAgent {
@@ -29,16 +41,14 @@ impl SurgeonAgent {
         modern_root: impl Into<PathBuf>,
         file_io_skill: Arc<dyn Skill>,
         file_write_skill: Arc<dyn Skill>,
-        llm_gateway: LlmGateway,
-        route: TaskModelConfig,
+        llm_client: Arc<ZeroClawClient>,
     ) -> Self {
         Self {
             legacy_root: legacy_root.into(),
             modern_root: modern_root.into(),
             file_io_skill,
             file_write_skill,
-            route,
-            llm_gateway,
+            llm_client,
         }
     }
 
@@ -46,73 +56,75 @@ impl SurgeonAgent {
         DEFAULT_SURGEON_MODEL
     }
 
-    pub fn provider(&self) -> LlmProvider {
-        self.route.provider
+    pub fn provider(&self) -> &'static str {
+        self.llm_client.provider_name()
     }
 
     async fn repair_ticket(&self, ticket: &mut Ticket) -> Result<Ticket> {
         ensure!(
-            !ticket.modern_file_paths.is_empty(),
-            "ticket {} does not contain any modern_file_paths for surgery",
+            !ticket.modern_file_paths.is_empty() || !ticket.test_file_paths.is_empty(),
+            "ticket {} does not contain any generated artifacts for surgery",
             ticket.id
-        );
-        ensure!(
-            ticket.modern_file_paths.len() == 1,
-            "surgeon currently supports exactly one generated file per ticket, got {}",
-            ticket.modern_file_paths.len()
         );
 
         let failure_reason = extract_failure_reason(ticket)?;
         let legacy_context = self
             .read_files(&self.legacy_root, &ticket.context_files)
+            .await
             .with_context(|| format!("failed to read legacy context for ticket {}", ticket.id))?;
-        let modern_context = self
+        let source_context = self
             .read_files(&self.modern_root, &ticket.modern_file_paths)
+            .await
             .with_context(|| {
                 format!(
                     "failed to read failing modern code for ticket {}",
                     ticket.id
                 )
             })?;
+        let test_context = self
+            .read_files(&self.modern_root, &ticket.test_file_paths)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to read failing generated tests for ticket {}",
+                    ticket.id
+                )
+            })?;
+        let execution_diff = serde_json::to_string_pretty(&ticket.last_execution_diff)
+            .context("failed to serialize execution diff for surgeon context")?;
+        let ast_diff = serde_json::to_string_pretty(&ticket.last_ast_diff)
+            .context("failed to serialize AST diff for surgeon context")?;
 
-        let response = self
-            .llm_gateway
-            .chat_completion(
-                &self.route,
+        let structured_call = self
+            .llm_client
+            .chat_with_schema(
+                TaskKind::Surgeon,
                 &self.system_prompt(ticket),
-                &self.user_prompt(ticket, failure_reason, &legacy_context, &modern_context),
+                &self.user_prompt(
+                    ticket,
+                    failure_reason,
+                    &legacy_context,
+                    &source_context,
+                    &test_context,
+                    &execution_diff,
+                    &ast_diff,
+                ),
+                self.fixed_files_tool(),
             )
             .await
             .with_context(|| format!("surgeon model failed for ticket {}", ticket.id))?;
-        let (response, usage) = response;
         info!(
             ticket_id = ticket.id.as_str(),
-            model = self.route.model.as_str(),
-            prompt_tokens = usage.prompt_tokens,
-            completion_tokens = usage.completion_tokens,
-            total_tokens = usage.total_tokens,
+            model = self.model(),
+            prompt_tokens = structured_call.usage.prompt_tokens,
+            completion_tokens = structured_call.usage.completion_tokens,
+            total_tokens = structured_call.usage.total_tokens,
             "Surgeon token usage"
         );
-        ticket.record_llm_usage(&usage);
-        let corrected_code = clean_code_response(&response);
+        ticket.record_llm_usage(&structured_call.usage);
+        let payload: FixedFilesPayload = structured_call.deserialize_arguments()?;
 
-        ensure!(
-            !corrected_code.trim().is_empty(),
-            "surgeon returned empty code for ticket {}",
-            ticket.id
-        );
-
-        let target_relative_path = ticket
-            .modern_file_paths
-            .first()
-            .context("ticket does not contain a target modern file path")?;
-        let target_output_path = self.modern_root.join(target_relative_path);
-        self.file_write_skill
-            .execute(vec![
-                target_output_path.to_string_lossy().into_owned(),
-                corrected_code,
-            ])
-            .with_context(|| format!("failed to overwrite modern file for ticket {}", ticket.id))?;
+        self.persist_fixed_files(ticket, payload).await?;
 
         ticket.retries = ticket.retries.saturating_add(1);
         ticket.status = TicketStatus::InProgress;
@@ -120,38 +132,90 @@ impl SurgeonAgent {
         info!(
             ticket_id = ticket.id.as_str(),
             retries = ticket.retries,
-            target_file = target_relative_path.as_str(),
-            "Surgeon patched failing code and returned ticket to verification"
+            source_file_count = ticket.modern_file_paths.len(),
+            test_file_count = ticket.test_file_paths.len(),
+            "Surgeon patched failing artifacts and returned ticket to verification"
         );
 
         Ok(ticket.clone())
     }
 
-    fn read_files(&self, root: &Path, relative_paths: &[String]) -> Result<String> {
+    async fn persist_fixed_files(&self, ticket: &Ticket, payload: FixedFilesPayload) -> Result<()> {
         ensure!(
-            !relative_paths.is_empty(),
-            "no relative paths provided for file read from {}",
-            root.display()
+            !payload.files.is_empty(),
+            "surgeon returned no files for ticket {}",
+            ticket.id
         );
+
+        let allowed_paths = ticket
+            .modern_file_paths
+            .iter()
+            .chain(ticket.test_file_paths.iter())
+            .map(|path| normalize_relative_path(path))
+            .collect::<Result<HashSet<_>>>()?;
+
+        for file in payload.files {
+            ensure!(
+                !file.content.trim().is_empty(),
+                "surgeon returned empty file content for ticket {} at path `{}`",
+                ticket.id,
+                file.path
+            );
+
+            let relative_path = normalize_relative_path(&file.path).with_context(|| {
+                format!(
+                    "surgeon returned an invalid file path for ticket {}",
+                    ticket.id
+                )
+            })?;
+            ensure!(
+                allowed_paths.contains(&relative_path),
+                "surgeon attempted to modify an unexpected file `{relative_path}` for ticket {}",
+                ticket.id
+            );
+
+            let target_output_path = self.modern_root.join(&relative_path);
+            self.file_write_skill
+                .execute(vec![
+                    target_output_path.to_string_lossy().into_owned(),
+                    file.content,
+                ])
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to overwrite modern file `{relative_path}` for ticket {}",
+                        ticket.id
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
+    async fn read_files(&self, root: &Path, relative_paths: &[String]) -> Result<String> {
+        if relative_paths.is_empty() {
+            return Ok(String::new());
+        }
 
         let mut args = vec![root.to_string_lossy().into_owned()];
         args.extend(relative_paths.iter().cloned());
-        self.file_io_skill.execute(args)
+        self.file_io_skill.execute(args).await
     }
 
     fn system_prompt(&self, ticket: &Ticket) -> String {
         format!(
             concat!(
                 "You are an Expert Debugger and Code Surgeon specializing in {framework} migrations.\n",
-                "You will receive legacy code, failing modern code, and a verifier failure reason.\n",
-                "Analyze the failure, locate the bug in the modern implementation, and output only the fully corrected raw modern code.\n",
+                "You will receive legacy code, failing generated source files, failing generated tests, a semantic execution diff, an AST diff, and a verifier failure reason.\n",
+                "You must respond by calling the provided tool exactly once.\n",
                 "Rules:\n",
-                "1. No markdown fences.\n",
-                "2. No explanations.\n",
-                "3. No preambles or summaries.\n",
-                "4. Output only the corrected contents for the failing modern file.\n",
+                "1. Return corrected versions of the failing generated source files and/or tests only.\n",
+                "2. Use the exact same relative file paths as the failing generated artifacts.\n",
+                "3. Do not return markdown fences, prose, or explanations.\n",
+                "4. Each file `content` must be raw compile-ready source code.\n",
                 "5. Preserve the intended behavior of the legacy implementation.\n",
-                "6. Fix the reported syntax and logic issues without changing unrelated behavior.\n"
+                "6. Fix the minimum set of files necessary for the behavioral shadow tests to match the legacy outputs.\n",
+                "7. Use the execution diff and AST diff to repair the exact missing or divergent logic.\n"
             ),
             framework = ticket.target_framework
         )
@@ -162,39 +226,78 @@ impl SurgeonAgent {
         ticket: &Ticket,
         failure_reason: &str,
         legacy_context: &str,
-        modern_context: &str,
+        source_context: &str,
+        test_context: &str,
+        execution_diff: &str,
+        ast_diff: &str,
     ) -> String {
         format!(
             concat!(
                 "Ticket ID: {ticket_id}\n",
                 "Description: {description}\n",
                 "Target framework: {target_framework}\n",
-                "Failing file: {modern_file}\n",
+                "Failing source files: {modern_files}\n",
+                "Failing test files: {test_files}\n",
                 "Failure reason: {failure_reason}\n",
                 "Legacy code:\n",
                 "{legacy_context}\n\n",
-                "Failing modern code:\n",
-                "{modern_context}\n"
+                "Generated source files:\n",
+                "{source_context}\n\n",
+                "Generated tests:\n",
+                "{test_context}\n\n",
+                "Execution diff JSON:\n",
+                "{execution_diff}\n\n",
+                "AST diff JSON:\n",
+                "{ast_diff}\n"
             ),
             ticket_id = ticket.id,
             description = ticket.description,
             target_framework = ticket.target_framework,
-            modern_file = ticket.modern_file_paths[0],
+            modern_files = ticket.modern_file_paths.join(", "),
+            test_files = ticket.test_file_paths.join(", "),
             failure_reason = failure_reason,
             legacy_context = legacy_context,
-            modern_context = modern_context
+            source_context = source_context,
+            test_context = test_context,
+            execution_diff = execution_diff,
+            ast_diff = ast_diff
         )
+    }
+
+    fn fixed_files_tool(&self) -> ToolSpec {
+        ToolSpec {
+            name: "submit_fixed_files".to_owned(),
+            description: "Return the corrected contents for the failing modern files".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "content": { "type": "string" }
+                            },
+                            "required": ["path", "content"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["files"],
+                "additionalProperties": false
+            }),
+        }
     }
 }
 
-#[async_trait]
 impl Agent for SurgeonAgent {
     fn name(&self) -> &str {
         SURGEON_NAME
     }
 
     fn model(&self) -> &str {
-        &self.route.model
+        self.llm_client.model_for(TaskKind::Surgeon)
     }
 
     async fn process_ticket(&self, ticket: &Ticket) -> Result<Ticket> {
@@ -228,34 +331,14 @@ fn extract_failure_reason(ticket: &Ticket) -> Result<&str> {
     }
 }
 
+fn normalize_relative_path(path: &str) -> Result<String> {
+    normalize_portable_relative_path(path, "file path").map(|path| path.into_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SurgeonAgent, extract_failure_reason};
-    use crate::agents::{Agent, Ticket, TicketStatus};
-    use crate::config::{LlmGateway, LlmProvider, TaskKind, TaskModelConfig};
-    use crate::skills::{FileIOSkill, FileWriteSkill};
-    use std::sync::Arc;
-
-    fn build_agent() -> SurgeonAgent {
-        SurgeonAgent::new(
-            "./legacy_app",
-            "./modern_app",
-            Arc::new(FileIOSkill),
-            Arc::new(FileWriteSkill),
-            LlmGateway::new().expect("gateway should build"),
-            TaskModelConfig::new(
-                TaskKind::Surgeon,
-                LlmProvider::OpenRouter,
-                SurgeonAgent::default_model(),
-            ),
-        )
-    }
-
-    #[test]
-    fn surgeon_uses_requested_default_model() {
-        let agent = build_agent();
-        assert_eq!(agent.model(), "anthropic/claude-3.5-sonnet");
-    }
+    use super::extract_failure_reason;
+    use crate::agents::{Ticket, TicketStatus};
 
     #[test]
     fn surgeon_extracts_failure_reason_from_failed_ticket() {
@@ -268,8 +351,11 @@ mod tests {
             target_framework: "TypeScript".to_owned(),
             dependencies: vec!["express".to_owned()],
             modern_file_paths: vec!["src/server.ts".to_owned()],
+            test_file_paths: vec!["tests/src/server.test.ts".to_owned()],
             retries: 1,
             token_usage: crate::agents::TicketTokenUsage::default(),
+            last_execution_diff: None,
+            last_ast_diff: None,
         };
 
         assert_eq!(
