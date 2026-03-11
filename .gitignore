@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+
+# Local environment and pipeline state
+.env
+.env.*
+!.env.example
+/.migration_state.json
+
+# Generated runtime output
+/logs/
+/modern_app/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+/.idea/
+/.vscode/
