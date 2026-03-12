@@ -176,7 +176,7 @@ impl ShadowWorkspace {
     }
 
     async fn cleanup(self) -> Result<()> {
-        match fs::remove_dir_all(&self.root).await {
+        match tokio::fs::remove_dir_all(&self.root).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error).with_context(|| {
