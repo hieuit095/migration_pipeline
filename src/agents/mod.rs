@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 use tempfile::Builder;
-use tokio::{fs as tokio_fs, io::AsyncReadExt, task};
+use tokio::{
+    fs as tokio_fs,
+    io::{AsyncReadExt, BufReader},
+    task,
+};
 
 use crate::config::ProjectTokenUsage;
 use crate::skills::{AstDiff, ExecutionDiff};
@@ -108,6 +112,8 @@ pub(crate) struct TemporaryPromptFile {
 }
 
 impl TemporaryPromptFile {
+    const STREAM_BUFFER_SIZE: usize = 8 * 1024;
+
     fn from_existing(path: PathBuf) -> Self {
         Self { path }
     }
@@ -147,18 +153,34 @@ impl TemporaryPromptFile {
     }
 
     async fn append_to(&self, output: &mut String) -> Result<()> {
-        let mut file = tokio_fs::File::open(&self.path).await.with_context(|| {
+        let file = tokio_fs::File::open(&self.path).await.with_context(|| {
             format!(
                 "failed to open temporary prompt file {}",
                 self.path.display()
             )
         })?;
-        file.read_to_string(output).await.with_context(|| {
-            format!(
-                "failed to read temporary prompt file {}",
-                self.path.display()
-            )
-        })?;
+        let mut reader = BufReader::new(file);
+        let mut buffer = [0_u8; Self::STREAM_BUFFER_SIZE];
+
+        loop {
+            let bytes_read = reader.read(&mut buffer).await.with_context(|| {
+                format!(
+                    "failed to read temporary prompt file {}",
+                    self.path.display()
+                )
+            })?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let chunk = std::str::from_utf8(&buffer[..bytes_read]).with_context(|| {
+                format!(
+                    "temporary prompt file contained invalid UTF-8: {}",
+                    self.path.display()
+                )
+            })?;
+            output.push_str(chunk);
+        }
         Ok(())
     }
 }

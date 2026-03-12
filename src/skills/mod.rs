@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use tempfile::Builder;
 use tokio::{fs as tokio_fs, task};
@@ -175,6 +175,8 @@ impl SourceLanguage {
 }
 
 impl FileIOSkill {
+    const STREAM_BUFFER_SIZE: usize = 8 * 1024;
+
     fn should_descend(entry: &DirEntry) -> bool {
         if !entry.file_type().is_dir() {
             return true;
@@ -222,20 +224,64 @@ impl FileIOSkill {
         Ok((BufWriter::new(file), path))
     }
 
+    fn is_utf8_text_file(path: &Path) -> Result<bool> {
+        let file = fs::File::open(path)
+            .with_context(|| format!("failed to open file {}", path.display()))?;
+        let mut reader = BufReader::new(file);
+        let mut buffer = [0_u8; Self::STREAM_BUFFER_SIZE];
+        let mut pending = Vec::new();
+        let mut combined = Vec::new();
+
+        loop {
+            let bytes_read = reader
+                .read(&mut buffer)
+                .with_context(|| format!("failed to read file {}", path.display()))?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let chunk = &buffer[..bytes_read];
+            if chunk.contains(&0) {
+                return Ok(false);
+            }
+
+            combined.clear();
+            combined.extend_from_slice(&pending);
+            combined.extend_from_slice(chunk);
+
+            match std::str::from_utf8(&combined) {
+                Ok(_) => pending.clear(),
+                Err(error) => match error.error_len() {
+                    Some(_) => return Ok(false),
+                    None => {
+                        let valid_up_to = error.valid_up_to();
+                        pending.clear();
+                        pending.extend_from_slice(&combined[valid_up_to..]);
+                    }
+                },
+            }
+        }
+
+        Ok(pending.is_empty())
+    }
+
     fn append_text_file(
         root: &Path,
         path: &Path,
         writer: &mut BufWriter<fs::File>,
     ) -> Result<bool> {
-        let Some(contents) = Self::read_text_file(path)? else {
+        if !Self::is_utf8_text_file(path)? {
             return Ok(false);
-        };
+        }
+
         let relative_path = Self::normalize_path(root, path);
         writeln!(writer, "// File: {relative_path}")
             .with_context(|| format!("failed to write context header for {}", path.display()))?;
-        writer
-            .write_all(contents.as_bytes())
-            .with_context(|| format!("failed to write context body for {}", path.display()))?;
+        let file = fs::File::open(path)
+            .with_context(|| format!("failed to open file {}", path.display()))?;
+        let mut reader = BufReader::new(file);
+        std::io::copy(&mut reader, writer)
+            .with_context(|| format!("failed to stream context body for {}", path.display()))?;
         writer
             .write_all(b"\n\n")
             .with_context(|| format!("failed to finalize context block for {}", path.display()))?;

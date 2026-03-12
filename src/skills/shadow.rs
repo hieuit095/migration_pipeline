@@ -2,15 +2,17 @@ use crate::config::DockerSandboxConfig;
 use crate::utils::path::{docker_bind_mount, normalize_relative_path};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::ErrorKind;
+use std::fs as std_fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tracing::warn;
+use tree_sitter::{Node, Parser};
 
 use super::sandbox::{
     SANDBOX_TIMEOUT_SECS, SandboxExecutionEnvironment, SandboxRuntime, build_container_name,
@@ -84,6 +86,8 @@ enum ShadowRuntime {
     Node,
     NodeTypeScript,
     Python,
+    Go,
+    Rust,
 }
 
 #[derive(Debug)]
@@ -91,6 +95,45 @@ struct ShadowInvocation {
     command: String,
     container_name: String,
     docker_args: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RenderedShadowRunner {
+    runner_name: String,
+    runner_contents: String,
+    inner_command: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallableReference {
+    Function(String),
+    Member { receiver: String, name: String },
+}
+
+#[derive(Debug, Clone)]
+struct ParameterBinding {
+    decode_type: String,
+    local_type: String,
+    local_name: String,
+    call_expr: String,
+}
+
+#[derive(Debug, Clone)]
+struct GoCallableSpec {
+    package_name: String,
+    import_path: Option<String>,
+    target_dir: Utf8PathBuf,
+    callable: CallableReference,
+    parameters: Vec<ParameterBinding>,
+    return_types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RustCallableSpec {
+    callable: CallableReference,
+    module_declaration: String,
+    parameters: Vec<ParameterBinding>,
+    return_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +196,7 @@ impl ShadowTestSkill {
     async fn run_target(
         &self,
         label: &str,
+        source_root: &Path,
         target: &ExecutionTarget,
         execution_environment: &SandboxExecutionEnvironment,
         fixture_path: &Path,
@@ -160,6 +204,7 @@ impl ShadowTestSkill {
         let invocation = build_invocation(
             &self.sandbox_skill,
             label,
+            source_root,
             target,
             execution_environment,
             fixture_path,
@@ -250,12 +295,14 @@ impl ShadowTestSkill {
                 let (legacy_result, modern_result) = tokio::join!(
                     self.run_target(
                         "legacy",
+                        &legacy_root,
                         &request.legacy_target,
                         &legacy_environment,
                         &fixture_path
                     ),
                     self.run_target(
                         "modern",
+                        &modern_root,
                         &request.modern_target,
                         &modern_environment,
                         &fixture_path
@@ -368,6 +415,7 @@ fn validate_target_path(root: &str, relative_path: &str) -> Result<()> {
 async fn build_invocation(
     sandbox_skill: &SandboxSkill,
     label: &str,
+    source_root: &Path,
     target: &ExecutionTarget,
     execution_environment: &SandboxExecutionEnvironment,
     fixture_path: &Path,
@@ -387,10 +435,17 @@ async fn build_invocation(
             .context("fixture file name was not valid unicode")?
     );
 
-    let (runner_name, runner_contents, inner_command) =
-        runtime.build_command(label, &module_path, &target.callable, &fixture_mount_path);
-    let runner_host_path = workspace_root.join(runner_name);
-    fs::write(&runner_host_path, runner_contents)
+    let rendered_runner = runtime.build_command(
+        label,
+        source_root,
+        &normalized_target,
+        execution_environment,
+        &module_path,
+        &target.callable,
+        &fixture_mount_path,
+    )?;
+    let runner_host_path = workspace_root.join(&rendered_runner.runner_name);
+    fs::write(&runner_host_path, rendered_runner.runner_contents)
         .await
         .with_context(|| {
             format!(
@@ -420,7 +475,7 @@ async fn build_invocation(
         docker_args.push(source_mount.to_owned());
     }
     docker_args.push(execution_environment.image().to_owned());
-    docker_args.extend(inner_command);
+    docker_args.extend(rendered_runner.inner_command);
 
     Ok(ShadowInvocation {
         command: format!("docker {}", docker_args.join(" ")),
@@ -631,6 +686,8 @@ impl ShadowRuntime {
             Some("js") | Some("mjs") | Some("cjs") => Ok(Self::Node),
             Some("ts") | Some("tsx") => Ok(Self::NodeTypeScript),
             Some("py") => Ok(Self::Python),
+            Some("go") => Ok(Self::Go),
+            Some("rs") => Ok(Self::Rust),
             Some(other) => bail!(
                 "ShadowTestSkill does not support the `.{other}` extension for shadow execution yet"
             ),
@@ -641,27 +698,30 @@ impl ShadowRuntime {
     fn build_command(
         self,
         label: &str,
+        source_root: &Path,
+        relative_path: &Utf8Path,
+        execution_environment: &SandboxExecutionEnvironment,
         module_path: &str,
         callable: &str,
         fixture_path: &str,
-    ) -> (String, &'static str, Vec<String>) {
+    ) -> Result<RenderedShadowRunner> {
         let runner_label = sanitize_runner_label(label);
-        match self {
-            Self::Node => (
-                format!("{runner_label}_shadow_runner.mjs"),
-                NODE_SHADOW_RUNNER,
-                vec![
+        let runner = match self {
+            Self::Node => RenderedShadowRunner {
+                runner_name: format!("{runner_label}_shadow_runner.mjs"),
+                runner_contents: NODE_SHADOW_RUNNER.to_owned(),
+                inner_command: vec![
                     "node".to_owned(),
                     format!("{SHADOW_MOUNT_POINT}/{runner_label}_shadow_runner.mjs"),
                     module_path.to_owned(),
                     callable.to_owned(),
                     fixture_path.to_owned(),
                 ],
-            ),
-            Self::NodeTypeScript => (
-                format!("{runner_label}_shadow_runner.mjs"),
-                NODE_SHADOW_RUNNER,
-                vec![
+            },
+            Self::NodeTypeScript => RenderedShadowRunner {
+                runner_name: format!("{runner_label}_shadow_runner.mjs"),
+                runner_contents: NODE_SHADOW_RUNNER.to_owned(),
+                inner_command: vec![
                     "node".to_owned(),
                     "--import=tsx".to_owned(),
                     format!("{SHADOW_MOUNT_POINT}/{runner_label}_shadow_runner.mjs"),
@@ -669,19 +729,36 @@ impl ShadowRuntime {
                     callable.to_owned(),
                     fixture_path.to_owned(),
                 ],
-            ),
-            Self::Python => (
-                format!("{runner_label}_shadow_runner.py"),
-                PYTHON_SHADOW_RUNNER,
-                vec![
+            },
+            Self::Python => RenderedShadowRunner {
+                runner_name: format!("{runner_label}_shadow_runner.py"),
+                runner_contents: PYTHON_SHADOW_RUNNER.to_owned(),
+                inner_command: vec![
                     "python".to_owned(),
                     format!("{SHADOW_MOUNT_POINT}/{runner_label}_shadow_runner.py"),
                     module_path.to_owned(),
                     callable.to_owned(),
                     fixture_path.to_owned(),
                 ],
-            ),
-        }
+            },
+            Self::Go => render_go_shadow_runner(
+                &runner_label,
+                source_root,
+                relative_path,
+                callable,
+                fixture_path,
+                execution_environment.workdir(),
+            )?,
+            Self::Rust => render_rust_shadow_runner(
+                &runner_label,
+                source_root,
+                relative_path,
+                callable,
+                fixture_path,
+            )?,
+        };
+
+        Ok(runner)
     }
 
     fn sandbox_runtime(self) -> SandboxRuntime {
@@ -689,6 +766,8 @@ impl ShadowRuntime {
             Self::Node => SandboxRuntime::Node,
             Self::NodeTypeScript => SandboxRuntime::NodeTypeScript,
             Self::Python => SandboxRuntime::Python,
+            Self::Go => SandboxRuntime::Go,
+            Self::Rust => SandboxRuntime::Rust,
         }
     }
 }

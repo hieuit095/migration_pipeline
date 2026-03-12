@@ -51,8 +51,12 @@ pub fn save_state(path: &str, ticket: &Ticket) -> Result<()> {
     transaction
         .execute(
             r#"
-                INSERT OR REPLACE INTO tickets (id, status, retries, payload)
+                INSERT INTO tickets (id, status, retries, payload)
                 VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    retries = excluded.retries,
+                    payload = excluded.payload
             "#,
             params![ticket.id.as_str(), status, retries, payload],
         )
