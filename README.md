@@ -1,68 +1,102 @@
-# AI-Powered Legacy Code Migration Pipeline
+# 🚀 ZeroClaw Migration Pipeline
 
-## Overview
-A high-performance, multi-agent production line for automating the migration of legacy codebases to modern stacks. Built with Rust for safety and concurrency, utilizing the ZeroClaw agent OS.
+![Rust](https://img.shields.io/badge/Rust-1.87+-orange.svg?logo=rust)
+![Docker](https://img.shields.io/badge/Docker-Shadow%20Testing-blue.svg?logo=docker)
+![AI](https://img.shields.io/badge/AI-Multi--Agent-purple.svg?logo=openai)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
 
-The pipeline now uses `zeroclaw` for OpenRouter-backed model routing and native structured tool calls. Each task can point at a different OpenRouter model without code changes.
+An industrial-grade, multi-agent AI pipeline built in Rust to automatically migrate legacy codebases (Node.js, Python, etc.) to modern stacks using a non-linear feedback loop.
 
-## Architecture
+## 🏗 Architecture & Non-Linear Feedback Loop
+
+```mermaid
+flowchart LR
+    A[Legacy Code] -->|AST Analysis| B(Blueprinter)
+    B -->|Tickets| C(Executor)
+    C -->|Modern Code & Tests| D{Verifier <br/> Docker Sandbox}
+    D -->|Failure / Diff| E(Surgeon)
+    E -.->|Recursive Patch| D
+    D -->|Success| F[Modern Code]
+```
+
 The pipeline utilizes a non-linear feedback loop with four specialized agents:
 
-1.  **Blueprinter (`google/gemini-3-flash-preview`)**: Analyzes the legacy codebase and generates a migration strategy (Tickets).
-2.  **Executor (`Minimax M2.5`)**: Translates legacy code blocks into the modern target stack and generates matching tests.
-3.  **Verifier (`z-ai/glm-5`)**: Generates shadow-test fixtures from the legacy AST, executes both legacy and modern code in isolated containers, and rejects any behavioral divergence.
-4.  **Surgeon (`Claude 3.5 Sonnet`)**: Performs deep recursive debugging for complex failures and feeds fixes back into verification.
+1. **Blueprinter:** Analyzes the legacy codebase Abstract Syntax Tree (AST) and plans independent migration tickets.
+2. **Executor:** Translates legacy code blocks into the modern target stack and generates matching tests.
+3. **Verifier:** Generates shadow-test fixtures from the legacy AST, executes both legacy and modern code in isolated Docker containers, and guarantees semantic equivalence by rejecting any behavioral divergence.
+4. **Surgeon:** Recursively patches failing code based on execution diffs from the Verifier until the tests pass.
 
-## Directory Structure
-- `src/main.rs`: Entry point and orchestration.
-- `src/config/`: Configuration for LLMs and API keys.
-- `src/agents/`: Agent implementations and traits.
-- `src/skills/`: Tooling for AST parsing (Tree-sitter) and File I/O.
-- `src/pipeline/`: Core feedback loop logic.
-- `src/utils/`: Telemetry and logging utilities.
-- `modern_app/`: Generated modernized source output written by the executor.
-- `logs/`: Daily rotating pipeline and audit logs, including `pipeline.log`.
+## ✨ Key Features
 
-## Getting Started
+- **Multi-Provider Routing:** Leverage the best LLMs for specific tasks using ZeroClaw (e.g., OpenAI, Together.ai, OpenRouter).
+- **Docker Sandbox Isolation:** Verification runs in short-lived Docker containers with `--network=none` for secure shadow testing, strict CPU/memory limits, and a read-only `modern_app` mount.
+- **AST-Aware Diffing:** Uses Tree-sitter to perform semantic analysis and generate precise execution diffs, bypassing brittle string matching.
+- **Resilient State Management:** Migration state (Tickets) is atomically checkpointed to an SQLite database (`.migration_state.db`), allowing the pipeline to pause and resume seamlessly.
+- **Interactive TUI:** A beautiful terminal interface powered by `inquire` to configure and track migration progress.
 
-### Prerequisites
-- Rust 1.87+
-- Docker with a running daemon
-- OpenRouter API Key
+## 🛠 Prerequisites
 
-### Build
-```bash
-cargo build
-```
+- **Rust:** Edition 2024, version 1.87 or higher.
+- **Docker:** A running Docker Daemon for isolated shadow testing.
+- **API Keys:** An active API key for your chosen LLM provider(s) (e.g., OpenRouter, OpenAI, Together.ai).
 
-### Configuration
-Create a `.env` file in the root directory:
+## 🚀 Installation & Getting Started
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/your-org/migration_pipeline.git
+   cd migration_pipeline
+   ```
+
+2. **Build the pipeline:**
+   ```bash
+   cargo build --release
+   ```
+
+## ⚙️ Configuration
+
+Create a `.env` file in the root directory to configure multi-provider routing. This allows you to route different agents to the most capable (or cost-effective) models.
+
 ```env
-OPENROUTER_API_KEY=your_api_key_here
+# .env.example
+OPENROUTER_API_KEY=your_openrouter_api_key_here
 
-# Per-task model routing
+# Route the Blueprinter to a reasoning model
 BLUEPRINTER_MODEL=google/gemini-3-flash-preview
 
-# Optional per-task overrides:
-# EXECUTOR_MODEL=minimax/minimax-m2.5
-# VERIFIER_MODEL=z-ai/glm-5
-# SURGEON_MODEL=anthropic/claude-3.5-sonnet
+# Route the Executor to a coding specialist
+EXECUTOR_MODEL=together_ai/meta-llama/Llama-3-70b-chat-hf
+
+# Verifier and Surgeon can also be independently routed
+VERIFIER_MODEL=z-ai/glm-5
+SURGEON_MODEL=anthropic/claude-3.5-sonnet
+
+# Maximum concurrent tickets
+MAX_CONCURRENT_TICKETS=3
 ```
 
-If a task-specific model override is omitted, the code falls back to the built-in default for that agent.
+## 💻 Usage
 
-Phase 2 now writes executor output under `modern_app/`, creating any missing parent directories automatically before each generated file is saved.
+Launch the interactive terminal interface:
 
-Phase 3 and later stages now use shadow testing as the primary quality gate. The verifier generates structured JSON fixtures from the legacy AST, runs the legacy and modern targets side-by-side in Docker, and records a strict execution diff before any ticket can be marked `Verified`.
+```bash
+cargo run --release
+```
 
-Phase 4 adds a non-linear feedback loop: failed tickets are routed through the surgeon, then bounced back to the verifier, with a hard retry cap of `3` surgeries per ticket.
+The TUI (powered by `inquire`) will guide you through:
+1. **Starting a Migration:** Setting the source directory of the legacy codebase and the destination directory for the modernized output.
+2. **Configuration:** Adjusting pipeline settings and confirming the target framework (e.g., "TypeScript on Node.js LTS").
+3. **Execution:** The pipeline will orchestrate the agents, write to `.migration_state.db`, and stream progress to the console.
 
-Phase 5 adds persistent checkpointing to `.migration_state.json`. The pipeline now resumes from the saved ticket state on startup and uses a dedicated Tokio MPSC-backed state writer to atomically checkpoint every ticket transition.
+## 🧠 AI/Agent Context (Repository Manifest)
 
-Phase 6 adds observability and auditability. Every LLM call now records provider/model metadata, prompt payloads, structured responses, and token usage in rotating `logs/pipeline.log.*` files, and each `Ticket` persists cumulative token usage in `.migration_state.json` for downstream cost reporting.
+> **Note to AI Coding Assistants:** Use this manifest to quickly navigate the project structure.
 
-Phase 7 removes direct host execution from verification. All syntax checks now run in short-lived Docker containers with `--network=none`, strict CPU and memory limits, and a read-only `modern_app` mount (`:ro`) to reduce code execution risk.
-
-The current LLM architecture no longer uses the custom `reqwest` gateway. Blueprinter, Executor, Verifier, and Surgeon call OpenRouter through `zeroclaw`, consume native tool-call payloads, and rely on gateway-level structured-output retries instead of local string-cleaning helpers.
-
-Current shadow execution runtime support is implemented for JavaScript, TypeScript, and Python entry points. Unsupported target runtimes fail fast with a descriptive error so they can be extended with project-specific harnesses.
+- `src/agents/`: Contains the core logic and traits for the 4 LLM actors (`Blueprinter`, `Executor`, `Verifier`, `Surgeon`).
+- `src/skills/`: Implementations of deterministic tools provided to the agents, including Docker integration (`SandboxSkill`, `ShadowTestSkill`), AST parsing (`ASTParsingSkill`), and File I/O.
+- `src/config/`: Configuration loading, `.env` parsing, and ZeroClaw multi-provider model routing.
+- `src/pipeline/`: Core orchestration of the non-linear feedback loop.
+- `src/utils/`: Telemetry, logging, and SQLite state management (`state.rs`).
+- `src/cli.rs`: The interactive Terminal User Interface (TUI) powered by `inquire`.
+- `src/main.rs`: The entry point that ties the configuration, CLI, and pipeline orchestration together.
+- `.migration_state.db`: The SQLite database used for durable state checkpointing.
