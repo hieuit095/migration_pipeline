@@ -17,11 +17,13 @@ use zeroclaw::providers::{
 };
 use zeroclaw::tools::ToolSpec;
 
+const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+const TOGETHER_API_KEY_ENV: &str = "TOGETHER_API_KEY";
 const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 const DOCKER_SANDBOX_MEMORY_ENV: &str = "DOCKER_SANDBOX_MEMORY";
 const DOCKER_SANDBOX_CPUS_ENV: &str = "DOCKER_SANDBOX_CPUS";
 const DEFAULT_TEMPERATURE: f64 = 0.1;
-const PROVIDER_NAME: &str = "openrouter";
+const DEFAULT_TASK_PROVIDER: &str = "openrouter";
 const MAX_FORMAT_RETRIES: usize = 3;
 const DEFAULT_DOCKER_SANDBOX_MEMORY: &str = "256m";
 const DEFAULT_DOCKER_SANDBOX_CPUS: &str = "0.5";
@@ -45,6 +47,57 @@ trait ChatBackend: Send + Sync {
 
 struct ZeroClawBackend {
     provider: Arc<dyn Provider>,
+    providers_by_hint: HashMap<String, String>,
+}
+
+#[derive(Debug)]
+struct ProviderHttpStatusError {
+    provider: String,
+    status_code: u16,
+    message: String,
+}
+
+impl ProviderHttpStatusError {
+    fn new(provider: impl Into<String>, status_code: u16, message: String) -> Self {
+        Self {
+            provider: provider.into(),
+            status_code,
+            message,
+        }
+    }
+}
+
+impl Display for ProviderHttpStatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} provider HTTP error ({}): {}",
+            self.provider, self.status_code, self.message
+        )
+    }
+}
+
+impl std::error::Error for ProviderHttpStatusError {}
+
+impl ZeroClawBackend {
+    fn provider_for_hint(&self, hint: &str) -> &str {
+        self.providers_by_hint
+            .get(hint)
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_TASK_PROVIDER)
+    }
+
+    fn normalize_error(provider: &str, error: anyhow::Error) -> anyhow::Error {
+        if let Some(status_code) = extract_http_status_code(&error) {
+            return anyhow!(ProviderHttpStatusError::new(
+                provider,
+                status_code,
+                error.to_string(),
+            ));
+        }
+
+        error
+    }
 }
 
 impl ChatBackend for ZeroClawBackend {
@@ -54,7 +107,13 @@ impl ChatBackend for ZeroClawBackend {
         model: &'a str,
         temperature: f64,
     ) -> ChatFuture<'a> {
-        Box::pin(async move { self.provider.chat(request, model, temperature).await })
+        let provider = self.provider_for_hint(model).to_owned();
+        Box::pin(async move {
+            self.provider
+                .chat(request, model, temperature)
+                .await
+                .map_err(|error| ZeroClawBackend::normalize_error(provider.as_str(), error))
+        })
     }
 }
 
@@ -103,14 +162,16 @@ impl Display for TaskKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskModelConfig {
     pub task: TaskKind,
+    pub provider: String,
     pub model: String,
     pub hint: String,
 }
 
 impl TaskModelConfig {
-    pub fn new(task: TaskKind, model: impl Into<String>) -> Self {
+    pub fn new(task: TaskKind, provider: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             task,
+            provider: normalize_provider_name(&provider.into()),
             model: model.into(),
             hint: format!("hint:{}", task.as_str()),
         }
@@ -120,13 +181,13 @@ impl TaskModelConfig {
         self.hint.strip_prefix("hint:").unwrap_or(&self.hint)
     }
 
-    fn as_model_route(&self) -> ModelRouteConfig {
-        ModelRouteConfig {
+    fn as_model_route(&self) -> Result<ModelRouteConfig> {
+        Ok(ModelRouteConfig {
             hint: self.route_name().to_owned(),
-            provider: PROVIDER_NAME.to_owned(),
+            provider: self.provider.clone(),
             model: self.model.clone(),
-            api_key: None,
-        }
+            api_key: provider_api_key(&self.provider)?,
+        })
     }
 }
 
@@ -162,37 +223,71 @@ pub struct ModelRouter;
 impl ModelRouter {
     pub fn from_env(task: TaskKind, default_model: &str) -> Result<TaskModelConfig> {
         let provider_env = task.provider_env();
-        if env::var(&provider_env)
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            warn!(
-                task = task.as_str(),
-                env_var = provider_env.as_str(),
-                "Ignoring deprecated provider override; OpenRouter is the only supported provider for this pipeline"
-            );
-        }
-
-        let model_key = task.model_env();
-        let model_value = match env::var(&model_key) {
-            Ok(value) if !value.trim().is_empty() => value,
-            Ok(_) => default_model.to_owned(),
-            Err(env::VarError::NotPresent) => default_model.to_owned(),
-            Err(error) => {
-                return Err(anyhow!("failed to read `{model_key}`: {error}"));
-            }
+        let provider_value = match read_optional_env(&provider_env)? {
+            Some(value) if !value.trim().is_empty() => normalize_provider_name(&value),
+            Some(_) | None => DEFAULT_TASK_PROVIDER.to_owned(),
         };
 
-        Ok(TaskModelConfig::new(task, model_value))
+        let model_key = task.model_env();
+        let model_value = match read_optional_env(&model_key)? {
+            Some(value) if !value.trim().is_empty() => value,
+            Some(_) | None => default_model.to_owned(),
+        };
+
+        Ok(TaskModelConfig::new(task, provider_value, model_value))
     }
 }
 
 fn read_env_with_default(key: &str, default: &str) -> Result<String> {
-    match env::var(key) {
-        Ok(value) if !value.trim().is_empty() => Ok(value),
-        Ok(_) | Err(env::VarError::NotPresent) => Ok(default.to_owned()),
-        Err(error) => Err(anyhow!("failed to read `{key}`: {error}")),
+    match read_optional_env(key)? {
+        Some(value) if !value.trim().is_empty() => Ok(value),
+        Some(_) | None => Ok(default.to_owned()),
     }
+}
+
+fn read_optional_env(key: &str) -> Result<Option<String>> {
+    match env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read `{key}`")),
+    }
+}
+
+fn normalize_provider_name(provider: &str) -> String {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "together.ai" | "together-ai" => "together".to_owned(),
+        normalized => normalized.to_owned(),
+    }
+}
+
+fn provider_api_key_env(provider: &str) -> Option<&'static str> {
+    match normalize_provider_name(provider).as_str() {
+        "openai" => Some(OPENAI_API_KEY_ENV),
+        "together" => Some(TOGETHER_API_KEY_ENV),
+        "openrouter" => Some(OPENROUTER_API_KEY_ENV),
+        _ => None,
+    }
+}
+
+fn provider_api_key(provider: &str) -> Result<Option<String>> {
+    let Some(env_key) = provider_api_key_env(provider) else {
+        return Ok(None);
+    };
+
+    match read_optional_env(env_key)? {
+        Some(value) if !value.trim().is_empty() => Ok(Some(value)),
+        Some(_) | None => Ok(None),
+    }
+}
+
+fn require_provider_api_key(provider: &str) -> Result<String> {
+    let env_key = provider_api_key_env(provider).with_context(|| {
+        format!(
+            "provider `{provider}` is not supported by this pipeline wrapper; supported providers are `openai`, `together`, and `openrouter`"
+        )
+    })?;
+    provider_api_key(provider)?
+        .with_context(|| format!("`{env_key}` is not configured for provider `{provider}`"))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -258,11 +353,21 @@ pub struct ZeroClawClient {
 
 impl ZeroClawClient {
     pub fn new(task_configs: Vec<TaskModelConfig>) -> Result<Self> {
-        let api_key = env::var(OPENROUTER_API_KEY_ENV).with_context(|| {
-            format!(
-                "{OPENROUTER_API_KEY_ENV} is not configured; OpenRouter is required for the ZeroClaw pipeline"
-            )
-        })?;
+        let primary_config = task_configs
+            .first()
+            .context("at least one task model configuration is required")?;
+        let mut providers_by_hint = HashMap::with_capacity(task_configs.len());
+        for config in &task_configs {
+            let expected_env_key =
+                provider_api_key_env(&config.provider).unwrap_or("UNKNOWN_API_KEY");
+            require_provider_api_key(&config.provider).with_context(|| {
+                format!(
+                    "missing API key for task `{}` provider `{}`; expected `{expected_env_key}`",
+                    config.task, config.provider
+                )
+            })?;
+            providers_by_hint.insert(config.hint.clone(), config.provider.clone());
+        }
         let default_model = task_configs
             .first()
             .map(|config| config.model.as_str())
@@ -270,25 +375,36 @@ impl ZeroClawClient {
         let model_routes = task_configs
             .iter()
             .map(TaskModelConfig::as_model_route)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let reliability = ReliabilityConfig {
             provider_retries: 1,
             provider_backoff_ms: 0,
             ..Default::default()
         };
         let provider = create_routed_provider(
-            PROVIDER_NAME,
-            Some(api_key.as_str()),
+            primary_config.provider.as_str(),
+            model_routes
+                .iter()
+                .find(|route| route.provider == primary_config.provider)
+                .and_then(|route| route.api_key.as_deref()),
             None,
             &reliability,
             &model_routes,
             default_model,
         )
-        .context("failed to initialize ZeroClaw OpenRouter provider router")?;
+        .with_context(|| {
+            format!(
+                "failed to initialize ZeroClaw provider router with primary provider `{}`",
+                primary_config.provider
+            )
+        })?;
         let provider: Arc<dyn Provider> = provider.into();
 
         Ok(Self {
-            backend: Arc::new(ZeroClawBackend { provider }),
+            backend: Arc::new(ZeroClawBackend {
+                provider,
+                providers_by_hint,
+            }),
             task_configs: build_task_config_map(task_configs)?,
             rate_limit_backoffs: RATE_LIMIT_BACKOFFS.to_vec(),
             max_format_retries: MAX_FORMAT_RETRIES,
@@ -302,8 +418,11 @@ impl ZeroClawClient {
             .unwrap_or("unconfigured")
     }
 
-    pub fn provider_name(&self) -> &'static str {
-        PROVIDER_NAME
+    pub fn provider_for(&self, task: TaskKind) -> &str {
+        self.task_configs
+            .get(&task)
+            .map(|config| config.provider.as_str())
+            .unwrap_or("unconfigured")
     }
 
     #[allow(dead_code)]
@@ -323,7 +442,7 @@ impl ZeroClawClient {
 
         info!(
             target: "audit::llm",
-            provider = self.provider_name(),
+            provider = route.provider.as_str(),
             task = task.as_str(),
             model = route.model.as_str(),
             latency_ms = started_at.elapsed().as_millis() as u64,
@@ -367,7 +486,7 @@ impl ZeroClawClient {
                 Ok((tool_name, arguments)) => {
                     info!(
                         target: "audit::llm",
-                        provider = self.provider_name(),
+                        provider = route.provider.as_str(),
                         task = task.as_str(),
                         model = route.model.as_str(),
                         format_retries = format_attempt,
@@ -387,7 +506,7 @@ impl ZeroClawClient {
                 Err(error) => {
                     warn!(
                         target: "audit::llm",
-                        provider = self.provider_name(),
+                        provider = route.provider.as_str(),
                         task = task.as_str(),
                         model = route.model.as_str(),
                         format_attempt = format_attempt + 1,
@@ -438,7 +557,7 @@ impl ZeroClawClient {
         if usage.is_none() {
             warn!(
                 target: "audit::llm",
-                provider = self.provider_name(),
+                provider = route.provider.as_str(),
                 task = task.as_str(),
                 model = route.model.as_str(),
                 "LLM response did not include usage metadata; defaulting token usage to zero"
@@ -463,7 +582,7 @@ impl ZeroClawClient {
 
         debug!(
             target: "audit::llm",
-            provider = self.provider_name(),
+            provider = route.provider.as_str(),
             task = route.task.as_str(),
             model = route.model.as_str(),
             system_prompt = system_prompt,
@@ -474,7 +593,7 @@ impl ZeroClawClient {
 
         info!(
             target: "audit::llm",
-            provider = self.provider_name(),
+            provider = route.provider.as_str(),
             task = route.task.as_str(),
             model = route.model.as_str(),
             system_prompt_chars = system_prompt.len(),
@@ -496,7 +615,7 @@ impl ZeroClawClient {
                 Ok(response) => {
                     debug!(
                         target: "audit::llm",
-                        provider = self.provider_name(),
+                        provider = route.provider.as_str(),
                         task = route.task.as_str(),
                         model = route.model.as_str(),
                         raw_response = ?response,
@@ -510,14 +629,14 @@ impl ZeroClawClient {
                     let backoff = self.rate_limit_backoffs[attempt];
                     warn!(
                         target: "audit::llm",
-                        provider = self.provider_name(),
+                        provider = route.provider.as_str(),
                         task = route.task.as_str(),
                         model = route.model.as_str(),
                         attempt = attempt + 1,
                         max_attempts,
                         backoff_ms = backoff.as_millis() as u64,
                         error = %error,
-                        "OpenRouter rate limited the request; retrying with exponential backoff"
+                        "Provider returned a retryable HTTP status; retrying with exponential backoff"
                     );
                     sleep(backoff).await;
                 }
@@ -622,27 +741,91 @@ fn truncate_for_error(value: &str) -> String {
     }
 }
 
+fn extract_http_status_code(error: &anyhow::Error) -> Option<u16> {
+    error
+        .downcast_ref::<ProviderHttpStatusError>()
+        .map(|error| error.status_code)
+        .or_else(|| {
+            error
+                .downcast_ref::<reqwest::Error>()
+                .and_then(|error| error.status())
+                .map(|status| status.as_u16())
+        })
+        .or_else(|| extract_provider_api_status_code(error))
+}
+
+fn extract_provider_api_status_code(error: &anyhow::Error) -> Option<u16> {
+    let message = error.to_string();
+    let (_, remainder) = message.split_once(" API error (")?;
+    let status_text = remainder.split_once("):")?.0;
+    let status_code = status_text.split_whitespace().next()?;
+    status_code.parse::<u16>().ok()
+}
+
 fn is_rate_limit_error(error: &anyhow::Error) -> bool {
-    let normalized = error.to_string().to_ascii_lowercase();
-    normalized.contains("429")
-        || normalized.contains("too many requests")
-        || normalized.contains("rate limit")
-        || normalized.contains("rate-limited")
+    matches!(extract_http_status_code(error), Some(429 | 503))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatBackend, DockerSandboxConfig, ModelRouter, ProjectTokenUsage, StructuredCall, TaskKind,
-        TaskModelConfig, ZeroClawClient,
+        ChatBackend, DockerSandboxConfig, ModelRouter, ProjectTokenUsage, ProviderHttpStatusError,
+        StructuredCall, TaskKind, TaskModelConfig, ZeroClawBackend, ZeroClawClient,
+        is_rate_limit_error,
     };
     use anyhow::{Result, anyhow};
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::time::Duration;
     use zeroclaw::providers::traits::TokenUsage;
     use zeroclaw::providers::{ChatRequest, ChatResponse, ToolCall};
     use zeroclaw::tools::ToolSpec;
+
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EnvVarGuard {
+        key: String,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: impl Into<String>, value: &str) -> Self {
+            let key = key.into();
+            let previous = std::env::var(&key).ok();
+            unsafe {
+                std::env::set_var(&key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn remove(key: impl Into<String>) -> Self {
+            let key = key.into();
+            let previous = std::env::var(&key).ok();
+            unsafe {
+                std::env::remove_var(&key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe {
+                    std::env::set_var(&self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(&self.key);
+                },
+            }
+        }
+    }
 
     #[derive(Default)]
     struct ScriptedBackend {
@@ -678,10 +861,26 @@ mod tests {
 
     fn build_task_configs() -> Vec<TaskModelConfig> {
         vec![
-            TaskModelConfig::new(TaskKind::Blueprinter, "google/gemini-3-flash-preview"),
-            TaskModelConfig::new(TaskKind::Executor, "minimax/minimax-m2.5"),
-            TaskModelConfig::new(TaskKind::Verifier, "z-ai/glm-5"),
-            TaskModelConfig::new(TaskKind::Surgeon, "anthropic/claude-3.5-sonnet"),
+            TaskModelConfig::new(
+                TaskKind::Blueprinter,
+                super::DEFAULT_TASK_PROVIDER,
+                "google/gemini-3-flash-preview",
+            ),
+            TaskModelConfig::new(
+                TaskKind::Executor,
+                super::DEFAULT_TASK_PROVIDER,
+                "minimax/minimax-m2.5",
+            ),
+            TaskModelConfig::new(
+                TaskKind::Verifier,
+                super::DEFAULT_TASK_PROVIDER,
+                "z-ai/glm-5",
+            ),
+            TaskModelConfig::new(
+                TaskKind::Surgeon,
+                super::DEFAULT_TASK_PROVIDER,
+                "anthropic/claude-sonnet-4.5",
+            ),
         ]
     }
 
@@ -724,35 +923,41 @@ mod tests {
     }
 
     #[test]
-    fn model_router_uses_default_model_when_env_is_missing() {
+    fn model_router_uses_default_provider_and_model_when_env_is_missing() {
+        let _env_lock = lock_env();
+        let _provider_env = EnvVarGuard::remove(TaskKind::Blueprinter.provider_env());
+        let _model_env = EnvVarGuard::remove(TaskKind::Blueprinter.model_env());
         let route = ModelRouter::from_env(TaskKind::Blueprinter, "google/gemini-3-flash-preview")
             .expect("model route should resolve");
 
+        assert_eq!(route.provider, super::DEFAULT_TASK_PROVIDER);
         assert_eq!(route.model, "google/gemini-3-flash-preview");
         assert_eq!(route.hint, "hint:blueprinter");
     }
 
     #[test]
+    fn model_router_uses_task_specific_provider_override() {
+        let _env_lock = lock_env();
+        let _provider_env = EnvVarGuard::set(TaskKind::Blueprinter.provider_env(), "Together.ai");
+        let _model_env = EnvVarGuard::set(
+            TaskKind::Blueprinter.model_env(),
+            "meta-llama/Llama-4-Maverick",
+        );
+
+        let route = ModelRouter::from_env(TaskKind::Blueprinter, "google/gemini-3-flash-preview")
+            .expect("model route should resolve");
+
+        assert_eq!(route.provider, "together");
+        assert_eq!(route.model, "meta-llama/Llama-4-Maverick");
+    }
+
+    #[test]
     fn docker_sandbox_config_uses_defaults_when_env_is_missing() {
-        let previous_memory = std::env::var(super::DOCKER_SANDBOX_MEMORY_ENV).ok();
-        let previous_cpus = std::env::var(super::DOCKER_SANDBOX_CPUS_ENV).ok();
-        unsafe {
-            std::env::remove_var(super::DOCKER_SANDBOX_MEMORY_ENV);
-            std::env::remove_var(super::DOCKER_SANDBOX_CPUS_ENV);
-        }
+        let _env_lock = lock_env();
+        let _memory_env = EnvVarGuard::remove(super::DOCKER_SANDBOX_MEMORY_ENV);
+        let _cpu_env = EnvVarGuard::remove(super::DOCKER_SANDBOX_CPUS_ENV);
 
         let config = DockerSandboxConfig::from_env().expect("sandbox config should load");
-
-        if let Some(value) = previous_memory {
-            unsafe {
-                std::env::set_var(super::DOCKER_SANDBOX_MEMORY_ENV, value);
-            }
-        }
-        if let Some(value) = previous_cpus {
-            unsafe {
-                std::env::set_var(super::DOCKER_SANDBOX_CPUS_ENV, value);
-            }
-        }
 
         assert_eq!(config.memory_limit, "256m");
         assert_eq!(config.cpu_limit, "0.5");
@@ -760,22 +965,63 @@ mod tests {
 
     #[test]
     fn zeroclaw_client_requires_openrouter_api_key() {
-        let previous = std::env::var(super::OPENROUTER_API_KEY_ENV).ok();
-        unsafe {
-            std::env::remove_var(super::OPENROUTER_API_KEY_ENV);
-        }
+        let _env_lock = lock_env();
+        let _openrouter_key = EnvVarGuard::remove(super::OPENROUTER_API_KEY_ENV);
 
         let error = ZeroClawClient::new(build_task_configs())
             .err()
             .expect("client should fail");
 
-        if let Some(value) = previous {
-            unsafe {
-                std::env::set_var(super::OPENROUTER_API_KEY_ENV, value);
-            }
-        }
-
         assert!(error.to_string().contains(super::OPENROUTER_API_KEY_ENV));
+    }
+
+    #[test]
+    fn zeroclaw_client_requires_openai_api_key_for_openai_routes() {
+        let _env_lock = lock_env();
+        let _openai_key = EnvVarGuard::remove(super::OPENAI_API_KEY_ENV);
+
+        let error = ZeroClawClient::new(vec![TaskModelConfig::new(
+            TaskKind::Blueprinter,
+            "openai",
+            "gpt-5",
+        )])
+        .err()
+        .expect("client should fail");
+
+        assert!(error.to_string().contains(super::OPENAI_API_KEY_ENV));
+    }
+
+    #[test]
+    fn task_model_config_injects_provider_specific_api_keys() {
+        let _env_lock = lock_env();
+        let _openai_key = EnvVarGuard::set(super::OPENAI_API_KEY_ENV, "openai-key");
+        let _together_key = EnvVarGuard::set(super::TOGETHER_API_KEY_ENV, "together-key");
+        let _openrouter_key = EnvVarGuard::set(super::OPENROUTER_API_KEY_ENV, "openrouter-key");
+
+        let openai_route = TaskModelConfig::new(TaskKind::Blueprinter, "openai", "gpt-5")
+            .as_model_route()
+            .expect("openai route should resolve");
+        let together_route = TaskModelConfig::new(
+            TaskKind::Executor,
+            "Together.ai",
+            "meta-llama/Llama-4-Maverick",
+        )
+        .as_model_route()
+        .expect("together route should resolve");
+        let openrouter_route = TaskModelConfig::new(
+            TaskKind::Verifier,
+            "openrouter",
+            "anthropic/claude-sonnet-4.5",
+        )
+        .as_model_route()
+        .expect("openrouter route should resolve");
+
+        assert_eq!(openai_route.provider, "openai");
+        assert_eq!(openai_route.api_key.as_deref(), Some("openai-key"));
+        assert_eq!(together_route.provider, "together");
+        assert_eq!(together_route.api_key.as_deref(), Some("together-key"));
+        assert_eq!(openrouter_route.provider, "openrouter");
+        assert_eq!(openrouter_route.api_key.as_deref(), Some("openrouter-key"));
     }
 
     #[tokio::test]
@@ -832,7 +1078,11 @@ mod tests {
     #[tokio::test]
     async fn chat_with_schema_retries_rate_limits() {
         let backend = Arc::new(ScriptedBackend::new(vec![
-            Err(anyhow!("429 Too Many Requests")),
+            Err(anyhow!(ProviderHttpStatusError::new(
+                "openrouter",
+                429,
+                "Too Many Requests".to_owned()
+            ))),
             Ok(response_with_tool_call(
                 serde_json::json!({
                     "tests_passed": true,
@@ -860,6 +1110,45 @@ mod tests {
 
         assert_eq!(call.tool_name, "submit_verification_report");
         assert_eq!(call.usage, ProjectTokenUsage::default());
+    }
+
+    #[test]
+    fn rate_limit_detection_only_accepts_typed_retryable_status_codes() {
+        let too_many_requests = anyhow!(ProviderHttpStatusError::new(
+            "openrouter",
+            429,
+            "Too Many Requests".to_owned()
+        ));
+        let service_unavailable = anyhow!(ProviderHttpStatusError::new(
+            "openrouter",
+            503,
+            "Service Unavailable".to_owned()
+        ));
+        let unauthorized = anyhow!(ProviderHttpStatusError::new(
+            "openrouter",
+            401,
+            "Unauthorized".to_owned()
+        ));
+        let free_form = anyhow!("429 Too Many Requests");
+
+        assert!(is_rate_limit_error(&too_many_requests));
+        assert!(is_rate_limit_error(&service_unavailable));
+        assert!(!is_rate_limit_error(&unauthorized));
+        assert!(!is_rate_limit_error(&free_form));
+    }
+
+    #[test]
+    fn zero_claw_backend_normalizes_provider_api_status_errors() {
+        let normalized = ZeroClawBackend::normalize_error(
+            "openrouter",
+            anyhow!("OpenRouter API error (429 Too Many Requests): retry later"),
+        );
+        let status_error = normalized
+            .downcast_ref::<ProviderHttpStatusError>()
+            .expect("provider status error should be normalized");
+
+        assert_eq!(status_error.provider, "openrouter");
+        assert_eq!(status_error.status_code, 429);
     }
 
     #[tokio::test]

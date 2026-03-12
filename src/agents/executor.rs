@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
@@ -10,10 +11,47 @@ use crate::config::{TaskKind, ZeroClawClient};
 use crate::skills::Skill;
 use crate::utils::path::normalize_relative_path as normalize_portable_relative_path;
 
-use super::{Agent, Ticket, TicketStatus};
+use super::{Agent, PromptContext, Ticket, TicketStatus};
 
 const EXECUTOR_NAME: &str = "executor";
 const DEFAULT_EXECUTOR_MODEL: &str = "minimax/minimax-m2.5";
+
+static FRAMEWORK_EXTENSIONS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+    HashMap::from([
+        ("react", "tsx"),
+        ("next", "tsx"),
+        ("next.js", "tsx"),
+        ("tsx", "tsx"),
+        ("typescript", "ts"),
+        ("node", "ts"),
+        ("node.js", "ts"),
+        ("nest", "ts"),
+        ("angular", "ts"),
+        ("go", "go"),
+        ("gin", "go"),
+        ("fiber", "go"),
+        ("rust", "rs"),
+        ("axum", "rs"),
+        ("actix", "rs"),
+        ("rocket", "rs"),
+        ("python", "py"),
+        ("django", "py"),
+        ("fastapi", "py"),
+        ("flask", "py"),
+        ("c#", "cs"),
+        (".net", "cs"),
+        ("asp.net", "cs"),
+        ("blazor", "cs"),
+        ("java", "java"),
+        ("spring", "java"),
+        ("kotlin", "kt"),
+        ("ktor", "kt"),
+        ("php", "php"),
+        ("laravel", "php"),
+        ("ruby", "rb"),
+        ("rails", "rb"),
+    ])
+});
 
 #[derive(Debug, Deserialize)]
 struct GeneratedArtifactsPayload {
@@ -62,8 +100,8 @@ impl ExecutorAgent {
         DEFAULT_EXECUTOR_MODEL
     }
 
-    pub fn provider(&self) -> &'static str {
-        self.llm_client.provider_name()
+    pub fn provider(&self) -> &str {
+        self.llm_client.provider_for(TaskKind::Executor)
     }
 
     async fn execute_ticket(&self, ticket: &mut Ticket) -> Result<PersistedArtifacts> {
@@ -73,17 +111,22 @@ impl ExecutorAgent {
             .with_context(|| format!("failed to load legacy context for ticket {}", ticket.id))?;
         let suggested_source_path = determine_output_relative_path(ticket)?;
         let suggested_test_path = determine_test_output_relative_path(&suggested_source_path)?;
+        let system_prompt = self.system_prompt(ticket);
+        let user_prompt = self
+            .user_prompt(
+                ticket,
+                &legacy_context,
+                &suggested_source_path,
+                &suggested_test_path,
+            )
+            .await
+            .with_context(|| format!("failed to build executor prompt for ticket {}", ticket.id))?;
         let structured_call = self
             .llm_client
             .chat_with_schema(
                 TaskKind::Executor,
-                &self.system_prompt(ticket),
-                &self.user_prompt(
-                    ticket,
-                    &legacy_context,
-                    &suggested_source_path,
-                    &suggested_test_path,
-                ),
+                &system_prompt,
+                &user_prompt,
                 self.generated_artifacts_tool(),
             )
             .await
@@ -108,7 +151,7 @@ impl ExecutorAgent {
         .await
     }
 
-    async fn load_legacy_context(&self, ticket: &Ticket) -> Result<String> {
+    async fn load_legacy_context(&self, ticket: &Ticket) -> Result<PromptContext> {
         if ticket.context_files.is_empty() {
             if ticket.legacy_code_snippet.trim().is_empty() {
                 return Err(anyhow!(
@@ -117,15 +160,16 @@ impl ExecutorAgent {
                 ));
             }
 
-            return Ok(format!(
+            return Ok(PromptContext::inline(format!(
                 "// File: legacy_snippet.txt\n{}",
                 ticket.legacy_code_snippet
-            ));
+            )));
         }
 
         let mut args = vec![self.legacy_root.to_string_lossy().into_owned()];
         args.extend(ticket.context_files.iter().cloned());
-        self.file_io_skill.execute(args).await
+        let context_path = self.file_io_skill.execute(args).await?;
+        Ok(PromptContext::from_temp_path(context_path))
     }
 
     async fn persist_generated_artifacts(
@@ -229,22 +273,23 @@ impl ExecutorAgent {
                 "Rules:\n",
                 "1. Return both `source_files` and `test_files`.\n",
                 "2. Each file `content` must be raw compile-ready source code.\n",
-                "3. Tests must run in an isolated Docker sandbox with no network access and no dependency installation.\n",
-                "4. Use relative paths only.\n",
-                "5. Preserve semantic behavior, data contracts, and side effects from the legacy code.\n",
-                "6. Make the tests deterministic and self-contained.\n"
+                "3. Tests run in a two-phase Docker sandbox: dependencies may be preinstalled during a warm-up step with temporary network access, but the actual execution phase has no network access.\n",
+                "4. Include any required dependency manifests or lockfiles (for example `package.json`, `requirements.txt`, or `go.mod`) when the generated code relies on third-party packages.\n",
+                "5. Use relative paths only.\n",
+                "6. Preserve semantic behavior, data contracts, and side effects from the legacy code.\n",
+                "7. Make the tests deterministic and self-contained.\n"
             ),
             framework = ticket.target_framework
         )
     }
 
-    fn user_prompt(
+    async fn user_prompt(
         &self,
         ticket: &Ticket,
-        legacy_context: &str,
+        legacy_context: &PromptContext,
         suggested_source_path: &str,
         suggested_test_path: &str,
-    ) -> String {
+    ) -> Result<String> {
         let dependencies = if ticket.dependencies.is_empty() {
             "None".to_owned()
         } else {
@@ -256,7 +301,7 @@ impl ExecutorAgent {
             ticket.context_files.join(", ")
         };
 
-        format!(
+        let prefix = format!(
             concat!(
                 "Ticket ID: {ticket_id}\n",
                 "Task: {description}\n",
@@ -267,8 +312,7 @@ impl ExecutorAgent {
                 "Relevant legacy files: {context_files}\n",
                 "Legacy snippet anchor:\n",
                 "{legacy_snippet}\n\n",
-                "Legacy context:\n",
-                "{legacy_context}\n"
+                "Legacy context:\n"
             ),
             ticket_id = ticket.id,
             description = ticket.description,
@@ -277,9 +321,14 @@ impl ExecutorAgent {
             suggested_test_path = suggested_test_path,
             dependencies = dependencies,
             context_files = context_files,
-            legacy_snippet = ticket.legacy_code_snippet,
-            legacy_context = legacy_context
-        )
+            legacy_snippet = ticket.legacy_code_snippet
+        );
+        let mut prompt =
+            String::with_capacity(prefix.len() + legacy_context.byte_len_hint().await? + 1);
+        prompt.push_str(&prefix);
+        legacy_context.append_to(&mut prompt).await?;
+        prompt.push('\n');
+        Ok(prompt)
     }
 
     fn generated_artifacts_tool(&self) -> ToolSpec {
@@ -405,49 +454,38 @@ fn determine_test_output_relative_path(source_relative_path: &str) -> Result<Str
 }
 
 fn target_extension(target_framework: &str, source_extension: Option<&str>) -> String {
-    let normalized = target_framework.to_ascii_lowercase();
+    framework_lookup_keys(target_framework)
+        .into_iter()
+        .find_map(|key| FRAMEWORK_EXTENSIONS.get(key.as_str()).copied())
+        .unwrap_or(source_extension.unwrap_or("txt"))
+        .to_owned()
+}
 
-    if normalized.contains("react") || normalized.contains("next") || normalized.contains("tsx") {
-        "tsx".to_owned()
-    } else if normalized.contains("typescript")
-        || normalized.contains("node")
-        || normalized.contains("nest")
-        || normalized.contains("angular")
+fn framework_lookup_keys(target_framework: &str) -> Vec<String> {
+    let normalized = target_framework.trim().to_ascii_lowercase();
+    let mut keys = Vec::new();
+
+    push_framework_key(&mut keys, normalized.clone());
+    push_framework_key(&mut keys, normalized.replace(' ', ""));
+
+    for token in normalized
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '#' | '+' | '.'))
+        })
+        .filter(|token| !token.is_empty())
     {
-        "ts".to_owned()
-    } else if normalized.contains("go")
-        || normalized.contains("gin")
-        || normalized.contains("fiber")
-    {
-        "go".to_owned()
-    } else if normalized.contains("rust")
-        || normalized.contains("axum")
-        || normalized.contains("actix")
-        || normalized.contains("rocket")
-    {
-        "rs".to_owned()
-    } else if normalized.contains("python")
-        || normalized.contains("django")
-        || normalized.contains("fastapi")
-        || normalized.contains("flask")
-    {
-        "py".to_owned()
-    } else if normalized.contains("c#")
-        || normalized.contains(".net")
-        || normalized.contains("asp.net")
-        || normalized.contains("blazor")
-    {
-        "cs".to_owned()
-    } else if normalized.contains("java") || normalized.contains("spring") {
-        "java".to_owned()
-    } else if normalized.contains("kotlin") || normalized.contains("ktor") {
-        "kt".to_owned()
-    } else if normalized.contains("php") || normalized.contains("laravel") {
-        "php".to_owned()
-    } else if normalized.contains("ruby") || normalized.contains("rails") {
-        "rb".to_owned()
-    } else {
-        source_extension.unwrap_or("txt").to_owned()
+        push_framework_key(&mut keys, token.to_owned());
+        if let Some(stripped_js) = token.strip_suffix(".js") {
+            push_framework_key(&mut keys, stripped_js.to_owned());
+        }
+    }
+
+    keys
+}
+
+fn push_framework_key(keys: &mut Vec<String>, key: String) {
+    if !key.is_empty() && !keys.contains(&key) {
+        keys.push(key);
     }
 }
 
@@ -485,7 +523,7 @@ fn file_array_schema() -> serde_json::Value {
 mod tests {
     use super::{
         determine_output_relative_path, determine_test_output_relative_path,
-        normalize_relative_path,
+        normalize_relative_path, target_extension,
     };
 
     #[test]
@@ -521,5 +559,11 @@ mod tests {
     fn normalize_relative_path_rejects_parent_traversal() {
         let error = normalize_relative_path("../secret.txt").expect_err("path should fail");
         assert!(error.to_string().contains("traverse"));
+    }
+
+    #[test]
+    fn target_extension_prefers_framework_alias_lookup() {
+        assert_eq!(target_extension("Next.js TypeScript", Some("js")), "tsx");
+        assert_eq!(target_extension("ASP.NET Core", Some("txt")), "cs");
     }
 }

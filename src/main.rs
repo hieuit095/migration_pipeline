@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use dotenv::dotenv;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,12 +8,12 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, error, info, warn};
 
 mod agents;
 mod config;
 mod pipeline;
+mod prompts;
 mod skills;
 mod utils;
 
@@ -25,8 +26,9 @@ use skills::{ASTParsingSkill, FileIOSkill, FileWriteSkill, ShadowTestSkill, Skil
 use utils::state::{load_state, save_state};
 
 const MAX_SURGERY_RETRIES: u8 = 3;
-const STATE_FILE: &str = ".migration_state.json";
-const STATE_FLUSH_INTERVAL_SECS: u64 = 3;
+const STATE_FILE: &str = ".migration_state.db";
+const MAX_CONCURRENT_TICKETS_ENV: &str = "MAX_CONCURRENT_TICKETS";
+const DEFAULT_MAX_CONCURRENT_TICKETS: usize = 3;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -114,7 +116,7 @@ async fn main() -> Result<()> {
         "Initialized phase-4 surgeon pipeline"
     );
 
-    let tickets = match load_state(STATE_FILE)? {
+    let tickets = match load_state_blocking(STATE_FILE.to_owned()).await? {
         Some(tickets) => {
             info!(
                 state_file = STATE_FILE,
@@ -133,11 +135,11 @@ async fn main() -> Result<()> {
                 ticket_count = tickets.len(),
                 "Generated migration blueprint"
             );
-            save_state(STATE_FILE, &tickets)?;
+            save_tickets_blocking(STATE_FILE.to_owned(), tickets.clone()).await?;
             info!(
                 state_file = STATE_FILE,
                 ticket_count = tickets.len(),
-                "Saved initial migration blueprint state"
+                "Saved initial migration blueprint state to SQLite"
             );
             tickets
         }
@@ -146,7 +148,12 @@ async fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel(100);
     let state_writer = tokio::spawn(run_state_writer(STATE_FILE.to_owned(), tickets.clone(), rx));
 
-    let concurrency_limit = Arc::new(Semaphore::new(3));
+    let max_concurrent_tickets = max_concurrent_tickets_from_env()?;
+    let concurrency_limit = Arc::new(Semaphore::new(max_concurrent_tickets));
+    info!(
+        max_concurrent_tickets,
+        "Initialized pipeline concurrency limit"
+    );
     let mut join_set = JoinSet::new();
 
     for ticket in tickets {
@@ -204,7 +211,7 @@ async fn main() -> Result<()> {
     info!(
         state_file = STATE_FILE,
         ticket_count = final_state.len(),
-        "State writer flushed final migration state"
+        "State writer completed migration state persistence"
     );
     let aggregated_usage = summarize_token_usage(&final_state);
     info!(
@@ -297,46 +304,44 @@ async fn run_state_writer(
     tickets: Vec<Ticket>,
     rx: mpsc::Receiver<Ticket>,
 ) -> Result<Vec<Ticket>> {
-    run_state_writer_with_flush_interval(
-        state_path,
-        tickets,
-        rx,
-        Duration::from_secs(STATE_FLUSH_INTERVAL_SECS),
-    )
-    .await
+    run_state_writer_with_flush_interval(state_path, tickets, rx, Duration::ZERO).await
 }
 
 async fn run_state_writer_with_flush_interval(
     state_path: String,
     mut tickets: Vec<Ticket>,
     mut rx: mpsc::Receiver<Ticket>,
-    flush_interval: Duration,
+    _flush_interval: Duration,
 ) -> Result<Vec<Ticket>> {
-    let mut flush_timer = interval(flush_interval);
-    flush_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    flush_timer.tick().await;
-    let mut has_pending_updates = false;
-
-    loop {
-        tokio::select! {
-            maybe_updated_ticket = rx.recv() => {
-                match maybe_updated_ticket {
-                    Some(updated_ticket) => {
-                        upsert_ticket(&mut tickets, updated_ticket);
-                        has_pending_updates = true;
-                    }
-                    None => {
-                        save_state(&state_path, &tickets)?;
-                        return Ok(tickets);
-                    }
-                }
-            }
-            _ = flush_timer.tick(), if has_pending_updates => {
-                save_state(&state_path, &tickets)?;
-                has_pending_updates = false;
-            }
-        }
+    while let Some(updated_ticket) = rx.recv().await {
+        save_state_blocking(state_path.clone(), updated_ticket.clone()).await?;
+        upsert_ticket(&mut tickets, updated_ticket);
     }
+
+    Ok(tickets)
+}
+
+async fn load_state_blocking(path: String) -> Result<Option<Vec<Ticket>>> {
+    tokio::task::spawn_blocking(move || load_state(&path))
+        .await
+        .map_err(|error| anyhow::anyhow!("state load task failed to join: {error}"))?
+}
+
+async fn save_state_blocking(path: String, ticket: Ticket) -> Result<()> {
+    tokio::task::spawn_blocking(move || save_state(&path, &ticket))
+        .await
+        .map_err(|error| anyhow::anyhow!("state save task failed to join: {error}"))?
+}
+
+async fn save_tickets_blocking(path: String, tickets: Vec<Ticket>) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        for ticket in tickets {
+            save_state(&path, &ticket)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("state save task failed to join: {error}"))?
 }
 
 fn upsert_ticket(tickets: &mut Vec<Ticket>, updated_ticket: Ticket) {
@@ -368,6 +373,27 @@ fn summarize_token_usage(tickets: &[Ticket]) -> TicketTokenUsage {
                 .saturating_add(ticket.token_usage.total_tokens);
             totals
         })
+}
+
+fn max_concurrent_tickets_from_env() -> Result<usize> {
+    match env::var(MAX_CONCURRENT_TICKETS_ENV) {
+        Ok(value) if !value.trim().is_empty() => {
+            let parsed = value.parse::<usize>().with_context(|| {
+                format!(
+                    "`{MAX_CONCURRENT_TICKETS_ENV}` must be a positive integer, received `{value}`"
+                )
+            })?;
+            ensure!(
+                parsed > 0,
+                "`{MAX_CONCURRENT_TICKETS_ENV}` must be greater than zero"
+            );
+            Ok(parsed)
+        }
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(DEFAULT_MAX_CONCURRENT_TICKETS),
+        Err(error) => Err(anyhow::anyhow!(
+            "failed to read `{MAX_CONCURRENT_TICKETS_ENV}`: {error}"
+        )),
+    }
 }
 
 fn resolve_project_root(
@@ -406,9 +432,11 @@ fn resolve_project_root(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_project_root, run_state_writer_with_flush_interval};
+    use super::{
+        load_state_blocking, max_concurrent_tickets_from_env, resolve_project_root,
+        run_state_writer_with_flush_interval,
+    };
     use crate::agents::{Ticket, TicketStatus, TicketTokenUsage};
-    use crate::utils::state::load_state;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -421,7 +449,7 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("{prefix}_{unique_id}"));
         fs::create_dir_all(&root).expect("temp directory should be created");
-        let state_path = root.join(".migration_state.json");
+        let state_path = root.join(".migration_state.db");
         (root, state_path)
     }
 
@@ -444,11 +472,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_writer_batches_updates_until_flush_interval() {
-        let (root, state_path) = make_temp_state_path("migration_pipeline_state_writer_batch");
+    async fn state_writer_persists_updates_immediately() {
+        let (root, state_path) = make_temp_state_path("migration_pipeline_state_writer_immediate");
         let initial_tickets = vec![sample_ticket("TICKET-1")];
         let (tx, rx) = mpsc::channel(4);
         let state_path_string = state_path.to_string_lossy().into_owned();
+        super::save_tickets_blocking(state_path_string.clone(), initial_tickets.clone())
+            .await
+            .expect("initial state should save");
 
         let writer = tokio::spawn(run_state_writer_with_flush_interval(
             state_path_string.clone(),
@@ -465,15 +496,10 @@ mod tests {
         .expect("update should send");
 
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(
-            !state_path.exists(),
-            "state writer should not flush immediately for each update"
-        );
-
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        let loaded = load_state(&state_path_string)
+        let loaded = load_state_blocking(state_path_string.clone())
+            .await
             .expect("state should load")
-            .expect("state file should exist after flush");
+            .expect("state database should exist after immediate write");
         assert_eq!(loaded[0].retries, 1);
 
         drop(tx);
@@ -486,11 +512,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_writer_flushes_pending_updates_when_channel_closes() {
+    async fn state_writer_retains_updates_when_channel_closes() {
         let (root, state_path) = make_temp_state_path("migration_pipeline_state_writer_close");
         let initial_tickets = vec![sample_ticket("TICKET-1")];
         let (tx, rx) = mpsc::channel(4);
         let state_path_string = state_path.to_string_lossy().into_owned();
+        super::save_tickets_blocking(state_path_string.clone(), initial_tickets.clone())
+            .await
+            .expect("initial state should save");
 
         let writer = tokio::spawn(run_state_writer_with_flush_interval(
             state_path_string.clone(),
@@ -512,9 +541,10 @@ mod tests {
             .expect("state writer should join")
             .expect("state writer should succeed");
 
-        let loaded = load_state(&state_path_string)
+        let loaded = load_state_blocking(state_path_string.clone())
+            .await
             .expect("state should load")
-            .expect("state file should exist after close flush");
+            .expect("state database should exist after channel close");
         assert_eq!(loaded[0].retries, 2);
 
         fs::remove_dir_all(root).expect("temp directory should be removed");
@@ -532,5 +562,45 @@ mod tests {
         assert_eq!(resolved, legacy_root);
 
         fs::remove_dir_all(root).expect("temp directory should be removed");
+    }
+
+    #[test]
+    fn max_concurrent_tickets_defaults_when_env_is_missing() {
+        let previous = std::env::var(super::MAX_CONCURRENT_TICKETS_ENV).ok();
+        unsafe {
+            std::env::remove_var(super::MAX_CONCURRENT_TICKETS_ENV);
+        }
+
+        let value = max_concurrent_tickets_from_env().expect("default concurrency should load");
+
+        if let Some(previous) = previous {
+            unsafe {
+                std::env::set_var(super::MAX_CONCURRENT_TICKETS_ENV, previous);
+            }
+        }
+
+        assert_eq!(value, super::DEFAULT_MAX_CONCURRENT_TICKETS);
+    }
+
+    #[test]
+    fn max_concurrent_tickets_rejects_zero() {
+        let previous = std::env::var(super::MAX_CONCURRENT_TICKETS_ENV).ok();
+        unsafe {
+            std::env::set_var(super::MAX_CONCURRENT_TICKETS_ENV, "0");
+        }
+
+        let error = max_concurrent_tickets_from_env().expect_err("zero concurrency should fail");
+
+        if let Some(previous) = previous {
+            unsafe {
+                std::env::set_var(super::MAX_CONCURRENT_TICKETS_ENV, previous);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(super::MAX_CONCURRENT_TICKETS_ENV);
+            }
+        }
+
+        assert!(error.to_string().contains("greater than zero"));
     }
 }

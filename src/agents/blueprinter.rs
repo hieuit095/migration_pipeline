@@ -8,7 +8,8 @@ use zeroclaw::tools::ToolSpec;
 use crate::config::{TaskKind, ZeroClawClient};
 use crate::skills::Skill;
 
-use super::{Agent, Ticket, TicketStatus, TicketTokenUsage};
+use super::{Agent, PromptContext, Ticket, TicketStatus, TicketTokenUsage};
+use crate::prompts;
 
 const BLUEPRINTER_NAME: &str = "blueprinter";
 const DEFAULT_BLUEPRINTER_MODEL: &str = "google/gemini-3-flash-preview";
@@ -65,8 +66,8 @@ impl BlueprinterAgent {
         DEFAULT_BLUEPRINTER_MODEL
     }
 
-    pub fn provider(&self) -> &'static str {
-        self.llm_client.provider_name()
+    pub fn provider(&self) -> &str {
+        self.llm_client.provider_for(TaskKind::Blueprinter)
     }
 
     pub async fn generate_blueprint(&self, legacy_dir_path: &str) -> Result<Vec<Ticket>> {
@@ -85,13 +86,26 @@ impl BlueprinterAgent {
             bytes = dependency_graph.len(),
             "Collected legacy codebase dependency graph"
         );
+        let dependency_graph = PromptContext::spill_to_tempfile(
+            "migration_pipeline_blueprinter_context_",
+            dependency_graph,
+        )
+        .await
+        .context("failed to stage dependency graph in a temporary prompt file")?;
+        let system_prompt = self
+            .system_prompt()
+            .context("failed to render blueprinter system prompt")?;
+        let user_prompt = self
+            .user_prompt(legacy_dir_path, &dependency_graph)
+            .await
+            .context("failed to render blueprinter user prompt")?;
 
         let structured_call = self
             .llm_client
             .chat_with_schema(
                 TaskKind::Blueprinter,
-                &self.system_prompt(),
-                &self.user_prompt(legacy_dir_path, &dependency_graph),
+                &system_prompt,
+                &user_prompt,
                 self.blueprint_tool(),
             )
             .await
@@ -108,30 +122,29 @@ impl BlueprinterAgent {
         Ok(payload.tickets.into_iter().map(Ticket::from).collect())
     }
 
-    fn system_prompt(&self) -> String {
-        concat!(
-            "You are a Staff Software Engineer specializing in large-scale legacy migrations.\n",
-            "Analyze the provided legacy codebase dependency graph and generate an industrial-grade migration blueprint.\n",
-            "You must respond by calling the provided tool exactly once.\n",
-            "Rules:\n",
-            "1. Preserve semantic equivalence and operational behavior.\n",
-            "2. Break work into independently executable tickets.\n",
-            "3. Use only relative file paths that actually exist in the supplied dependency graph.\n",
-            "4. `legacy_code_snippet` must be a concise structural summary inferred from the graph, not raw source text.\n",
-            "5. `target_framework` should be the best-fit modern destination for that ticket.\n",
-            "6. `dependencies` should list concrete libraries, frameworks, or runtime dependencies.\n",
-            "7. Do not emit markdown fences, plain text, or explanations.\n"
-        )
-        .to_owned()
+    fn system_prompt(&self) -> Result<String> {
+        prompts::render("blueprinter/system.j2", serde_json::json!({}))
     }
 
-    fn user_prompt(&self, legacy_dir_path: &str, dependency_graph: &str) -> String {
-        format!(
-            "Analyze the legacy codebase dependency graph below and create a migration blueprint.\n\
-Legacy directory: {legacy_dir_path}\n\
-Dependency graph JSON:\n\
-{dependency_graph}\n"
-        )
+    async fn user_prompt(
+        &self,
+        legacy_dir_path: &str,
+        dependency_graph: &PromptContext,
+    ) -> Result<String> {
+        let prefix = format!(
+            concat!(
+                "Analyze the legacy codebase dependency graph below and create a migration blueprint.\n",
+                "Legacy directory: {legacy_dir_path}\n",
+                "Dependency graph JSON:\n"
+            ),
+            legacy_dir_path = legacy_dir_path
+        );
+        let mut prompt =
+            String::with_capacity(prefix.len() + dependency_graph.byte_len_hint().await? + 1);
+        prompt.push_str(&prefix);
+        dependency_graph.append_to(&mut prompt).await?;
+        prompt.push('\n');
+        Ok(prompt)
     }
 
     fn blueprint_tool(&self) -> ToolSpec {

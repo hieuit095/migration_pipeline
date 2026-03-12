@@ -1,5 +1,5 @@
 use crate::config::DockerSandboxConfig;
-use crate::utils::path::{container_path, docker_bind_mount, normalize_relative_path};
+use crate::utils::path::{docker_bind_mount, normalize_relative_path};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
@@ -13,8 +13,8 @@ use tokio::fs;
 use tracing::warn;
 
 use super::sandbox::{
-    APP_MOUNT_POINT, SANDBOX_TIMEOUT_SECS, build_container_name, preferred_output,
-    run_docker_command,
+    SANDBOX_TIMEOUT_SECS, SandboxExecutionEnvironment, SandboxRuntime, build_container_name,
+    preferred_output, run_docker_command,
 };
 use super::{SandboxSkill, Skill};
 
@@ -153,17 +153,25 @@ impl ShadowTestSkill {
     async fn run_target(
         &self,
         label: &str,
-        root: &str,
         target: &ExecutionTarget,
+        execution_environment: &SandboxExecutionEnvironment,
         fixture_path: &Path,
     ) -> Result<ExecutionRecord> {
-        let root = PathBuf::from(root);
-        let invocation =
-            build_invocation(&self.sandbox_skill, label, &root, target, fixture_path).await?;
+        let invocation = build_invocation(
+            &self.sandbox_skill,
+            label,
+            target,
+            execution_environment,
+            fixture_path,
+        )
+        .await?;
+        let container_guard = self
+            .sandbox_skill
+            .arm_container_cleanup(invocation.container_name.clone());
         let output = run_docker_command(
             &invocation.docker_args,
             Duration::from_secs(SANDBOX_TIMEOUT_SECS),
-            Some(invocation.container_name.as_str()),
+            Some(container_guard),
         )
         .await
         .with_context(|| format!("failed to run {label} shadow container"))?;
@@ -188,6 +196,34 @@ impl Skill for ShadowTestSkill {
         let request = parse_request(&args)?;
         validate_request(&request)?;
         self.sandbox_skill.ensure_docker_ready().await?;
+        let legacy_root = PathBuf::from(&request.legacy_root);
+        let modern_root = PathBuf::from(&request.modern_root);
+        let legacy_relative = normalize_relative_path(
+            &request.legacy_target.relative_path,
+            "shadow execution target",
+        )?;
+        let modern_relative = normalize_relative_path(
+            &request.modern_target.relative_path,
+            "shadow execution target",
+        )?;
+        let legacy_environment = self
+            .sandbox_skill
+            .prepare_execution_environment(
+                "shadow-legacy",
+                &legacy_root,
+                ShadowRuntime::from_path(&legacy_relative)?.sandbox_runtime(),
+                std::slice::from_ref(&legacy_relative),
+            )
+            .await?;
+        let modern_environment = self
+            .sandbox_skill
+            .prepare_execution_environment(
+                "shadow-modern",
+                &modern_root,
+                ShadowRuntime::from_path(&modern_relative)?.sandbox_runtime(),
+                std::slice::from_ref(&modern_relative),
+            )
+            .await?;
 
         let workspace = ShadowWorkspace::create().await?;
         let execution_result = async {
@@ -199,14 +235,14 @@ impl Skill for ShadowTestSkill {
                 let (legacy_result, modern_result) = tokio::join!(
                     self.run_target(
                         "legacy",
-                        &request.legacy_root,
                         &request.legacy_target,
+                        &legacy_environment,
                         &fixture_path
                     ),
                     self.run_target(
                         "modern",
-                        &request.modern_root,
                         &request.modern_target,
+                        &modern_environment,
                         &fixture_path
                     )
                 );
@@ -300,8 +336,8 @@ fn validate_target_path(root: &str, relative_path: &str) -> Result<()> {
 async fn build_invocation(
     sandbox_skill: &SandboxSkill,
     label: &str,
-    root: &Path,
     target: &ExecutionTarget,
+    execution_environment: &SandboxExecutionEnvironment,
     fixture_path: &Path,
 ) -> Result<ShadowInvocation> {
     let normalized_target =
@@ -310,7 +346,7 @@ async fn build_invocation(
     let workspace_root = fixture_path
         .parent()
         .context("fixture path must have a parent directory")?;
-    let module_path = container_path(APP_MOUNT_POINT, normalized_target.as_path());
+    let module_path = execution_environment.container_path(normalized_target.as_path());
     let fixture_mount_path = format!(
         "{SHADOW_MOUNT_POINT}/{}",
         fixture_path
@@ -319,7 +355,7 @@ async fn build_invocation(
             .context("fixture file name was not valid unicode")?
     );
 
-    let (image, runner_name, runner_contents, inner_command) =
+    let (runner_name, runner_contents, inner_command) =
         runtime.build_command(label, &module_path, &target.callable, &fixture_mount_path);
     let runner_host_path = workspace_root.join(runner_name);
     fs::write(&runner_host_path, runner_contents)
@@ -343,13 +379,15 @@ async fn build_invocation(
         "--cap-drop=ALL".to_owned(),
         "--security-opt=no-new-privileges:true".to_owned(),
         "--workdir".to_owned(),
-        APP_MOUNT_POINT.to_owned(),
-        "--mount".to_owned(),
-        docker_bind_mount(root, APP_MOUNT_POINT, true)?,
+        execution_environment.workdir().to_owned(),
         "--mount".to_owned(),
         docker_bind_mount(workspace_root, SHADOW_MOUNT_POINT, true)?,
-        image.to_owned(),
     ];
+    if let Some(source_mount) = execution_environment.source_mount() {
+        docker_args.push("--mount".to_owned());
+        docker_args.push(source_mount.to_owned());
+    }
+    docker_args.push(execution_environment.image().to_owned());
     docker_args.extend(inner_command);
 
     Ok(ShadowInvocation {
@@ -528,11 +566,10 @@ impl ShadowRuntime {
         module_path: &str,
         callable: &str,
         fixture_path: &str,
-    ) -> (&'static str, String, &'static str, Vec<String>) {
+    ) -> (String, &'static str, Vec<String>) {
         let runner_label = sanitize_runner_label(label);
         match self {
             Self::Node => (
-                "node:alpine",
                 format!("{runner_label}_shadow_runner.mjs"),
                 NODE_SHADOW_RUNNER,
                 vec![
@@ -544,7 +581,6 @@ impl ShadowRuntime {
                 ],
             ),
             Self::Deno => (
-                "denoland/deno:alpine",
                 format!("{runner_label}_shadow_runner.ts"),
                 DENO_SHADOW_RUNNER,
                 vec![
@@ -558,7 +594,6 @@ impl ShadowRuntime {
                 ],
             ),
             Self::Python => (
-                "python:alpine",
                 format!("{runner_label}_shadow_runner.py"),
                 PYTHON_SHADOW_RUNNER,
                 vec![
@@ -569,6 +604,14 @@ impl ShadowRuntime {
                     fixture_path.to_owned(),
                 ],
             ),
+        }
+    }
+
+    fn sandbox_runtime(self) -> SandboxRuntime {
+        match self {
+            Self::Node => SandboxRuntime::Node,
+            Self::Deno => SandboxRuntime::Deno,
+            Self::Python => SandboxRuntime::Python,
         }
     }
 }
@@ -844,13 +887,13 @@ mod tests {
 
     #[test]
     fn build_command_uses_label_specific_runner_name() {
-        let (_, legacy_runner_name, _, legacy_command) = ShadowRuntime::Node.build_command(
+        let (legacy_runner_name, _, legacy_command) = ShadowRuntime::Node.build_command(
             "legacy",
             "/app/src/server.js",
             "bootstrap",
             "/shadow/fixture.json",
         );
-        let (_, modern_runner_name, _, modern_command) = ShadowRuntime::Node.build_command(
+        let (modern_runner_name, _, modern_command) = ShadowRuntime::Node.build_command(
             "modern",
             "/app/src/server.js",
             "bootstrap",

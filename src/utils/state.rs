@@ -1,101 +1,152 @@
-use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use tempfile::NamedTempFile;
+use rusqlite::{Connection, params};
 
-use crate::agents::Ticket;
+use crate::agents::{Ticket, TicketStatus};
+
+const CREATE_TICKETS_TABLE_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS tickets (
+        id TEXT PRIMARY KEY NOT NULL,
+        status TEXT NOT NULL,
+        retries INTEGER NOT NULL,
+        payload TEXT NOT NULL
+    )
+"#;
 
 pub fn load_state(path: &str) -> Result<Option<Vec<Ticket>>> {
-    let path = Path::new(path);
+    let connection = open_state_connection(path)?;
+    let mut statement = connection
+        .prepare("SELECT payload FROM tickets ORDER BY id")
+        .context("failed to prepare state load query")?;
+    let payload_rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("failed to query persisted tickets from state database")?;
 
-    if !path.exists() {
-        return Ok(None);
+    let mut tickets = Vec::new();
+    for payload_row in payload_rows {
+        let payload = payload_row.context("failed to read ticket payload from state database")?;
+        let ticket = serde_json::from_str::<Ticket>(&payload)
+            .context("failed to deserialize ticket payload from state database")?;
+        tickets.push(ticket);
     }
 
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read migration state from {}", path.display()))?;
-    let tickets = serde_json::from_str::<Vec<Ticket>>(&contents)
-        .with_context(|| format!("failed to parse migration state from {}", path.display()))?;
-
-    Ok(Some(tickets))
+    if tickets.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(tickets))
+    }
 }
 
-pub fn save_state(path: &str, tickets: &[Ticket]) -> Result<()> {
-    let path = Path::new(path);
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create parent directories for state file {}",
-                    path.display()
-                )
-            })?;
-        }
-    }
-
+pub fn save_state(path: &str, ticket: &Ticket) -> Result<()> {
+    let mut connection = open_state_connection(path)?;
     let payload =
-        serde_json::to_string_pretty(tickets).context("failed to serialize migration state")?;
-    let state_directory = state_directory(path);
-    let mut temp_file = NamedTempFile::new_in(state_directory).with_context(|| {
+        serde_json::to_string(ticket).context("failed to serialize migration ticket state")?;
+    let retries = i64::from(ticket.retries);
+    let status = ticket_status_label(&ticket.status);
+    let transaction = connection
+        .transaction()
+        .context("failed to begin ticket state upsert transaction")?;
+
+    transaction
+        .execute(
+            r#"
+                INSERT OR REPLACE INTO tickets (id, status, retries, payload)
+                VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![ticket.id.as_str(), status, retries, payload],
+        )
+        .with_context(|| {
+            format!(
+                "failed to upsert persisted state for ticket `{}` into SQLite",
+                ticket.id
+            )
+        })?;
+    transaction.commit().with_context(|| {
         format!(
-            "failed to create temporary migration state file in {}",
-            state_directory.display()
+            "failed to commit persisted state for ticket `{}`",
+            ticket.id
         )
     })?;
 
-    temp_file.write_all(payload.as_bytes()).with_context(|| {
+    Ok(())
+}
+
+fn open_state_connection(path: &str) -> Result<Connection> {
+    let path = resolve_state_path(Path::new(path))?;
+    let state_directory = state_directory(&path)?;
+    std::fs::create_dir_all(&state_directory).with_context(|| {
         format!(
-            "failed to write temporary migration state file in {}",
-            state_directory.display()
-        )
-    })?;
-    temp_file.as_file_mut().sync_all().with_context(|| {
-        format!(
-            "failed to sync temporary migration state file {}",
+            "failed to create parent directories for state database {}",
             path.display()
         )
     })?;
 
-    temp_file
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| {
-            format!(
-                "failed to persist temporary migration state file to {}",
-                path.display()
-            )
-        })?;
-    Ok(())
+    let connection = Connection::open(&path)
+        .with_context(|| format!("failed to open SQLite state database {}", path.display()))?;
+    initialize_schema(&connection)?;
+
+    Ok(connection)
 }
 
-fn state_directory(path: &Path) -> &Path {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
+fn initialize_schema(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(CREATE_TICKETS_TABLE_SQL)
+        .context("failed to initialize SQLite migration state schema")
+}
+
+fn resolve_state_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("failed to resolve current working directory for state database")?
+            .join(path))
+    }
+}
+
+fn state_directory(path: &Path) -> Result<PathBuf> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .with_context(|| {
+            format!(
+                "state database path must have a parent directory: {}",
+                path.display()
+            )
+        })
+}
+
+fn ticket_status_label(status: &TicketStatus) -> &'static str {
+    match status {
+        TicketStatus::Todo => "todo",
+        TicketStatus::InProgress => "in_progress",
+        TicketStatus::Verified => "verified",
+        TicketStatus::Failed(_) => "failed",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{load_state, save_state};
-    use crate::agents::{Ticket, TicketStatus};
+    use crate::agents::{Ticket, TicketStatus, TicketTokenUsage};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn state_round_trips_through_disk() {
+    fn make_temp_state_path(prefix: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let unique_id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be monotonic")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("migration_pipeline_state_{unique_id}"));
+        let root = std::env::temp_dir().join(format!("{prefix}_{unique_id}"));
         fs::create_dir_all(&root).expect("temp directory should be created");
-        let state_path = root.join(".migration_state.json");
+        let state_path = root.join(".migration_state.db");
+        (root, state_path)
+    }
 
-        let tickets = vec![Ticket {
-            id: "STATE-1".to_owned(),
+    fn sample_ticket(id: &str) -> Ticket {
+        Ticket {
+            id: id.to_owned(),
             description: "Persist ticket".to_owned(),
             context_files: vec!["src/server.js".to_owned()],
             status: TicketStatus::InProgress,
@@ -105,7 +156,7 @@ mod tests {
             modern_file_paths: vec!["src/server.ts".to_owned()],
             test_file_paths: vec!["tests/src/server.test.ts".to_owned()],
             retries: 1,
-            token_usage: crate::agents::TicketTokenUsage {
+            token_usage: TicketTokenUsage {
                 llm_calls: 2,
                 prompt_tokens: 120,
                 completion_tokens: 45,
@@ -113,9 +164,15 @@ mod tests {
             },
             last_execution_diff: None,
             last_ast_diff: None,
-        }];
+        }
+    }
 
-        save_state(state_path.to_string_lossy().as_ref(), &tickets).expect("state should save");
+    #[test]
+    fn state_round_trips_through_sqlite() {
+        let (root, state_path) = make_temp_state_path("migration_pipeline_state");
+        let ticket = sample_ticket("STATE-1");
+
+        save_state(state_path.to_string_lossy().as_ref(), &ticket).expect("state should save");
         let loaded = load_state(state_path.to_string_lossy().as_ref())
             .expect("state should load")
             .expect("state should exist");
@@ -129,55 +186,17 @@ mod tests {
     }
 
     #[test]
-    fn save_state_replaces_existing_file_atomically() {
-        let unique_id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic")
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("migration_pipeline_state_replace_{unique_id}"));
-        fs::create_dir_all(&root).expect("temp directory should be created");
-        let state_path = root.join(".migration_state.json");
+    fn save_state_upserts_existing_ticket_row() {
+        let (root, state_path) = make_temp_state_path("migration_pipeline_state_replace");
+        let initial_ticket = sample_ticket("STATE-UPSERT");
+        let mut replacement_ticket = sample_ticket("STATE-UPSERT");
+        replacement_ticket.status = TicketStatus::Verified;
+        replacement_ticket.retries = 2;
+        replacement_ticket.description = "Updated ticket".to_owned();
 
-        let initial_tickets = vec![Ticket {
-            id: "STATE-OLD".to_owned(),
-            description: "Old ticket".to_owned(),
-            context_files: vec!["src/old.js".to_owned()],
-            status: TicketStatus::Todo,
-            legacy_code_snippet: "old();".to_owned(),
-            target_framework: "TypeScript".to_owned(),
-            dependencies: vec![],
-            modern_file_paths: Vec::new(),
-            test_file_paths: Vec::new(),
-            retries: 0,
-            token_usage: crate::agents::TicketTokenUsage::default(),
-            last_execution_diff: None,
-            last_ast_diff: None,
-        }];
-        let replacement_tickets = vec![Ticket {
-            id: "STATE-NEW".to_owned(),
-            description: "New ticket".to_owned(),
-            context_files: vec!["src/new.js".to_owned()],
-            status: TicketStatus::Verified,
-            legacy_code_snippet: "new();".to_owned(),
-            target_framework: "TypeScript".to_owned(),
-            dependencies: vec!["express".to_owned()],
-            modern_file_paths: vec!["src/new.ts".to_owned()],
-            test_file_paths: vec!["tests/src/new.test.ts".to_owned()],
-            retries: 2,
-            token_usage: crate::agents::TicketTokenUsage {
-                llm_calls: 1,
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                total_tokens: 15,
-            },
-            last_execution_diff: None,
-            last_ast_diff: None,
-        }];
-
-        save_state(state_path.to_string_lossy().as_ref(), &initial_tickets)
+        save_state(state_path.to_string_lossy().as_ref(), &initial_ticket)
             .expect("initial state should save");
-        save_state(state_path.to_string_lossy().as_ref(), &replacement_tickets)
+        save_state(state_path.to_string_lossy().as_ref(), &replacement_ticket)
             .expect("replacement state should save");
 
         let loaded = load_state(state_path.to_string_lossy().as_ref())
@@ -185,9 +204,22 @@ mod tests {
             .expect("state should exist");
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, "STATE-NEW");
+        assert_eq!(loaded[0].id, "STATE-UPSERT");
         assert_eq!(loaded[0].status, TicketStatus::Verified);
         assert_eq!(loaded[0].retries, 2);
+        assert_eq!(loaded[0].description, "Updated ticket");
+
+        fs::remove_dir_all(root).expect("temp directory should be removed");
+    }
+
+    #[test]
+    fn load_state_creates_empty_database_when_missing() {
+        let (root, state_path) = make_temp_state_path("migration_pipeline_state_init");
+
+        let loaded = load_state(state_path.to_string_lossy().as_ref()).expect("state should load");
+
+        assert!(loaded.is_none());
+        assert!(state_path.exists());
 
         fs::remove_dir_all(root).expect("temp directory should be removed");
     }

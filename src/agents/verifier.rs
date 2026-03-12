@@ -54,8 +54,8 @@ impl VerifierAgent {
         DEFAULT_VERIFIER_MODEL
     }
 
-    pub fn provider(&self) -> &'static str {
-        self.llm_client.provider_name()
+    pub fn provider(&self) -> &str {
+        self.llm_client.provider_for(TaskKind::Verifier)
     }
 
     async fn verify_ticket(&self, ticket: &mut Ticket) -> Result<Ticket> {

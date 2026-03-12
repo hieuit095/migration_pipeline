@@ -11,10 +11,10 @@ use crate::config::{TaskKind, ZeroClawClient};
 use crate::skills::Skill;
 use crate::utils::path::normalize_relative_path as normalize_portable_relative_path;
 
-use super::{Agent, Ticket, TicketStatus};
+use super::{Agent, PromptContext, Ticket, TicketStatus};
 
 const SURGEON_NAME: &str = "surgeon";
-const DEFAULT_SURGEON_MODEL: &str = "anthropic/claude-3.5-sonnet";
+const DEFAULT_SURGEON_MODEL: &str = "anthropic/claude-sonnet-4.5";
 
 #[derive(Debug, Deserialize)]
 struct FixedFilesPayload {
@@ -56,8 +56,8 @@ impl SurgeonAgent {
         DEFAULT_SURGEON_MODEL
     }
 
-    pub fn provider(&self) -> &'static str {
-        self.llm_client.provider_name()
+    pub fn provider(&self) -> &str {
+        self.llm_client.provider_for(TaskKind::Surgeon)
     }
 
     async fn repair_ticket(&self, ticket: &mut Ticket) -> Result<Ticket> {
@@ -94,21 +94,26 @@ impl SurgeonAgent {
             .context("failed to serialize execution diff for surgeon context")?;
         let ast_diff = serde_json::to_string_pretty(&ticket.last_ast_diff)
             .context("failed to serialize AST diff for surgeon context")?;
+        let system_prompt = self.system_prompt(ticket);
+        let user_prompt = self
+            .user_prompt(
+                ticket,
+                failure_reason,
+                &legacy_context,
+                &source_context,
+                &test_context,
+                &execution_diff,
+                &ast_diff,
+            )
+            .await
+            .with_context(|| format!("failed to build surgeon prompt for ticket {}", ticket.id))?;
 
         let structured_call = self
             .llm_client
             .chat_with_schema(
                 TaskKind::Surgeon,
-                &self.system_prompt(ticket),
-                &self.user_prompt(
-                    ticket,
-                    failure_reason,
-                    &legacy_context,
-                    &source_context,
-                    &test_context,
-                    &execution_diff,
-                    &ast_diff,
-                ),
+                &system_prompt,
+                &user_prompt,
                 self.fixed_files_tool(),
             )
             .await
@@ -192,14 +197,15 @@ impl SurgeonAgent {
         Ok(())
     }
 
-    async fn read_files(&self, root: &Path, relative_paths: &[String]) -> Result<String> {
+    async fn read_files(&self, root: &Path, relative_paths: &[String]) -> Result<PromptContext> {
         if relative_paths.is_empty() {
-            return Ok(String::new());
+            return Ok(PromptContext::inline(String::new()));
         }
 
         let mut args = vec![root.to_string_lossy().into_owned()];
         args.extend(relative_paths.iter().cloned());
-        self.file_io_skill.execute(args).await
+        let context_path = self.file_io_skill.execute(args).await?;
+        Ok(PromptContext::from_temp_path(context_path))
     }
 
     fn system_prompt(&self, ticket: &Ticket) -> String {
@@ -221,17 +227,22 @@ impl SurgeonAgent {
         )
     }
 
-    fn user_prompt(
+    async fn user_prompt(
         &self,
         ticket: &Ticket,
         failure_reason: &str,
-        legacy_context: &str,
-        source_context: &str,
-        test_context: &str,
+        legacy_context: &PromptContext,
+        source_context: &PromptContext,
+        test_context: &PromptContext,
         execution_diff: &str,
         ast_diff: &str,
-    ) -> String {
-        format!(
+    ) -> Result<String> {
+        let total_len_hint = legacy_context.byte_len_hint().await?
+            + source_context.byte_len_hint().await?
+            + test_context.byte_len_hint().await?;
+        let execution_sections_len = execution_diff.len() + ast_diff.len();
+        let mut prompt = String::with_capacity(total_len_hint + execution_sections_len + 512);
+        prompt.push_str(&format!(
             concat!(
                 "Ticket ID: {ticket_id}\n",
                 "Description: {description}\n",
@@ -239,29 +250,26 @@ impl SurgeonAgent {
                 "Failing source files: {modern_files}\n",
                 "Failing test files: {test_files}\n",
                 "Failure reason: {failure_reason}\n",
-                "Legacy code:\n",
-                "{legacy_context}\n\n",
-                "Generated source files:\n",
-                "{source_context}\n\n",
-                "Generated tests:\n",
-                "{test_context}\n\n",
-                "Execution diff JSON:\n",
-                "{execution_diff}\n\n",
-                "AST diff JSON:\n",
-                "{ast_diff}\n"
+                "Legacy code:\n"
             ),
             ticket_id = ticket.id,
             description = ticket.description,
             target_framework = ticket.target_framework,
             modern_files = ticket.modern_file_paths.join(", "),
             test_files = ticket.test_file_paths.join(", "),
-            failure_reason = failure_reason,
-            legacy_context = legacy_context,
-            source_context = source_context,
-            test_context = test_context,
-            execution_diff = execution_diff,
-            ast_diff = ast_diff
-        )
+            failure_reason = failure_reason
+        ));
+        legacy_context.append_to(&mut prompt).await?;
+        prompt.push_str("\n\nGenerated source files:\n");
+        source_context.append_to(&mut prompt).await?;
+        prompt.push_str("\n\nGenerated tests:\n");
+        test_context.append_to(&mut prompt).await?;
+        prompt.push_str("\n\nExecution diff JSON:\n");
+        prompt.push_str(execution_diff);
+        prompt.push_str("\n\nAST diff JSON:\n");
+        prompt.push_str(ast_diff);
+        prompt.push('\n');
+        Ok(prompt)
     }
 
     fn fixed_files_tool(&self) -> ToolSpec {
