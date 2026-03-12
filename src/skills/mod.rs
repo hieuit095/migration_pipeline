@@ -1858,10 +1858,14 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}_{unique_id}"))
     }
 
-    fn read_context_file(path: &str) -> String {
+    async fn read_context_file(path: &str) -> String {
         let path = std::path::Path::new(path);
-        let contents = fs::read_to_string(path).expect("context temp file should be readable");
-        fs::remove_file(path).expect("context temp file should be removable");
+        let contents = tokio::fs::read_to_string(path)
+            .await
+            .expect("context temp file should be readable");
+        tokio::fs::remove_file(path)
+            .await
+            .expect("context temp file should be removable");
         contents
     }
 
@@ -2137,7 +2141,7 @@ pub fn bootstrap(port: u16) -> String {
             .execute(vec![root.to_string_lossy().to_string()])
             .await
             .expect("skill should succeed");
-        let output = read_context_file(&output);
+        let output = read_context_file(&output).await;
 
         assert!(output.contains("// File: src/app.js"));
         assert!(output.contains("console.log('hello');"));
@@ -2162,7 +2166,7 @@ pub fn bootstrap(port: u16) -> String {
             ])
             .await
             .expect("skill should read selected files");
-        let output = read_context_file(&output);
+        let output = read_context_file(&output).await;
 
         assert!(output.contains("// File: src/db.js"));
         assert!(!output.contains("src/app.js"));
