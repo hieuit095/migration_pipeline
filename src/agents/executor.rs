@@ -110,7 +110,8 @@ impl ExecutorAgent {
             .await
             .with_context(|| format!("failed to load legacy context for ticket {}", ticket.id))?;
         let suggested_source_path = determine_output_relative_path(ticket)?;
-        let suggested_test_path = determine_test_output_relative_path(&suggested_source_path)?;
+        let suggested_test_path =
+            determine_test_output_relative_path(ticket, &suggested_source_path)?;
         let system_prompt = self.system_prompt(ticket);
         let user_prompt = self
             .user_prompt(
@@ -277,7 +278,13 @@ impl ExecutorAgent {
                 "4. Include any required dependency manifests or lockfiles (for example `package.json`, `requirements.txt`, or `go.mod`) when the generated code relies on third-party packages.\n",
                 "5. Use relative paths only.\n",
                 "6. Preserve semantic behavior, data contracts, and side effects from the legacy code.\n",
-                "7. Make the tests deterministic and self-contained.\n"
+                "7. Make the tests deterministic and self-contained.\n",
+                "8. Minimize output size: no comments, no docstrings, no decorative whitespace, and no unnecessary helper abstractions.\n",
+                "9. Prefer the smallest number of files and the shortest viable tests that still cover the legacy behavior.\n",
+                "10. Prefer Node.js standard library features over third-party dependencies unless the legacy behavior requires otherwise.\n",
+                "11. Only generate files that are necessary for this ticket. Do not regenerate unrelated modules from other tickets.\n",
+                "12. Unless the ticket explicitly asks for project-wide runtime or build configuration, do not emit global files such as package.json, tsconfig.json, or lockfiles.\n",
+                "13. If the ticket is a project-wide runtime/build/configuration task, prefer configuration files plus one minimal smoke or integration test instead of rewriting unrelated business modules.\n"
             ),
             framework = ticket.target_framework
         )
@@ -300,6 +307,11 @@ impl ExecutorAgent {
         } else {
             ticket.context_files.join(", ")
         };
+        let ticket_scope_guidance = if is_project_scaffolding_ticket(ticket) {
+            "Ticket scope guidance: this is a project-wide runtime/build/configuration task. Prefer configuration files (for example tsconfig.json, package.json, build scripts) and one minimal smoke or integration test. Do not rewrite unrelated business modules unless the task explicitly requires it."
+        } else {
+            "Ticket scope guidance: this is a file-scoped migration. Prefer rewriting only the directly relevant module(s) and its matching tests. Do not emit unrelated app files or duplicate other tickets."
+        };
 
         let prefix = format!(
             concat!(
@@ -310,6 +322,7 @@ impl ExecutorAgent {
                 "Suggested primary test path: {suggested_test_path}\n",
                 "Dependencies: {dependencies}\n",
                 "Relevant legacy files: {context_files}\n",
+                "{ticket_scope_guidance}\n",
                 "Legacy snippet anchor:\n",
                 "{legacy_snippet}\n\n",
                 "Legacy context:\n"
@@ -321,6 +334,7 @@ impl ExecutorAgent {
             suggested_test_path = suggested_test_path,
             dependencies = dependencies,
             context_files = context_files,
+            ticket_scope_guidance = ticket_scope_guidance,
             legacy_snippet = ticket.legacy_code_snippet
         );
         let mut prompt =
@@ -394,6 +408,10 @@ fn normalize_relative_path(path: &str) -> Result<String> {
 }
 
 fn determine_output_relative_path(ticket: &Ticket) -> Result<String> {
+    if is_project_scaffolding_ticket(ticket) {
+        return project_scaffolding_output_path(ticket);
+    }
+
     let default_filename = sanitize_for_filename(&ticket.id);
     let source_relative_path = ticket
         .context_files
@@ -424,7 +442,28 @@ fn determine_output_relative_path(ticket: &Ticket) -> Result<String> {
     normalize_relative_path(output_path.to_string_lossy().as_ref())
 }
 
-fn determine_test_output_relative_path(source_relative_path: &str) -> Result<String> {
+fn determine_test_output_relative_path(
+    ticket: &Ticket,
+    source_relative_path: &str,
+) -> Result<String> {
+    if is_project_scaffolding_ticket(ticket) || is_configuration_file(source_relative_path) {
+        let extension = target_extension(&ticket.target_framework, None);
+        let smoke_file = if extension == "go" {
+            "migration_smoke_test.go".to_owned()
+        } else if extension == "py" {
+            "test_migration_smoke.py".to_owned()
+        } else {
+            format!("migration_smoke.test.{extension}")
+        };
+
+        return normalize_relative_path(
+            Path::new("tests")
+                .join(smoke_file)
+                .to_string_lossy()
+                .as_ref(),
+        );
+    }
+
     let source_path = Path::new(source_relative_path);
     let extension = source_path
         .extension()
@@ -451,6 +490,46 @@ fn determine_test_output_relative_path(source_relative_path: &str) -> Result<Str
     };
 
     normalize_relative_path(relative_dir.join(file_name).to_string_lossy().as_ref())
+}
+
+fn project_scaffolding_output_path(ticket: &Ticket) -> Result<String> {
+    let framework = ticket.target_framework.to_ascii_lowercase();
+    let path = if framework.contains("type") || framework.contains("node") {
+        "tsconfig.json"
+    } else if framework.contains("go") {
+        "go.mod"
+    } else if framework.contains("python") {
+        "pyproject.toml"
+    } else if framework.contains("rust") {
+        "Cargo.toml"
+    } else {
+        "migration_config.txt"
+    };
+
+    normalize_relative_path(path)
+}
+
+fn is_project_scaffolding_ticket(ticket: &Ticket) -> bool {
+    let description = ticket.description.to_ascii_lowercase();
+    ticket.context_files.len() > 1
+        || description.contains("project-wide")
+        || description.contains("runtime and build foundation")
+        || description.contains("runtime foundation")
+        || description.contains("compiler configuration")
+        || description.contains("module targeting")
+        || description.contains("output layout")
+        || description.contains("build foundation")
+        || description.contains("build configuration")
+        || description.contains("scaffold")
+}
+
+fn is_configuration_file(relative_path: &str) -> bool {
+    matches!(
+        Path::new(relative_path)
+            .file_name()
+            .and_then(|value| value.to_str()),
+        Some("package.json" | "tsconfig.json" | "Cargo.toml" | "go.mod" | "pyproject.toml")
+    )
 }
 
 fn target_extension(target_framework: &str, source_extension: Option<&str>) -> String {
@@ -550,9 +629,53 @@ mod tests {
 
     #[test]
     fn executor_derives_test_path_from_source_path() {
-        let path = determine_test_output_relative_path("src/server.ts")
+        let ticket = crate::agents::Ticket {
+            id: "EXEC-1".to_owned(),
+            description: "Migrate HTTP service".to_owned(),
+            context_files: vec!["src/server.js".to_owned()],
+            status: crate::agents::TicketStatus::Todo,
+            legacy_code_snippet: "http.createServer(...)".to_owned(),
+            target_framework: "TypeScript".to_owned(),
+            dependencies: vec!["express".to_owned()],
+            modern_file_paths: Vec::new(),
+            test_file_paths: Vec::new(),
+            retries: 0,
+            token_usage: crate::agents::TicketTokenUsage::default(),
+            last_execution_diff: None,
+            last_ast_diff: None,
+        };
+
+        let path = determine_test_output_relative_path(&ticket, "src/server.ts")
             .expect("executor test path should normalize");
         assert_eq!(path, "tests/src/server.test.ts");
+    }
+
+    #[test]
+    fn executor_prefers_config_path_for_project_scaffolding_ticket() {
+        let ticket = crate::agents::Ticket {
+            id: "EXEC-FOUNDATION".to_owned(),
+            description: "Establish the project-wide TypeScript runtime and build foundation"
+                .to_owned(),
+            context_files: vec!["server.js".to_owned(), "src/telebot.js".to_owned()],
+            status: crate::agents::TicketStatus::Todo,
+            legacy_code_snippet: "Project-wide TypeScript foundation".to_owned(),
+            target_framework: "TypeScript on Node.js LTS".to_owned(),
+            dependencies: vec!["typescript".to_owned()],
+            modern_file_paths: Vec::new(),
+            test_file_paths: Vec::new(),
+            retries: 0,
+            token_usage: crate::agents::TicketTokenUsage::default(),
+            last_execution_diff: None,
+            last_ast_diff: None,
+        };
+
+        let source_path =
+            determine_output_relative_path(&ticket).expect("config ticket path should normalize");
+        let test_path = determine_test_output_relative_path(&ticket, &source_path)
+            .expect("config ticket test path should normalize");
+
+        assert_eq!(source_path, "tsconfig.json");
+        assert_eq!(test_path, "tests/migration_smoke.test.ts");
     }
 
     #[test]

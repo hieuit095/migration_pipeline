@@ -9,7 +9,7 @@ use zeroclaw::tools::ToolSpec;
 use crate::config::{TaskKind, ZeroClawClient};
 use crate::skills::{
     AstDiff, ExecutionDiff, ExecutionTarget, ShadowFixture, ShadowTestRequest, Skill,
-    diff_dependency_graphs, parse_dependency_graph_json,
+    TerminalCommandOutput, diff_dependency_graphs, parse_dependency_graph_json,
 };
 use crate::utils::path::normalize_relative_path as normalize_portable_relative_path;
 
@@ -17,6 +17,7 @@ use super::{Agent, Ticket, TicketStatus};
 
 const VERIFIER_NAME: &str = "verifier";
 const DEFAULT_VERIFIER_MODEL: &str = "z-ai/glm-5";
+const MAX_SHADOW_FIXTURES: usize = 8;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ShadowFixturePlan {
@@ -29,6 +30,7 @@ pub struct VerifierAgent {
     legacy_root: PathBuf,
     modern_root: PathBuf,
     ast_parsing_skill: Arc<dyn Skill>,
+    sandbox_skill: Arc<dyn Skill>,
     shadow_test_skill: Arc<dyn Skill>,
     llm_client: Arc<ZeroClawClient>,
 }
@@ -38,6 +40,7 @@ impl VerifierAgent {
         legacy_root: impl Into<PathBuf>,
         modern_root: impl Into<PathBuf>,
         ast_parsing_skill: Arc<dyn Skill>,
+        sandbox_skill: Arc<dyn Skill>,
         shadow_test_skill: Arc<dyn Skill>,
         llm_client: Arc<ZeroClawClient>,
     ) -> Self {
@@ -45,6 +48,7 @@ impl VerifierAgent {
             legacy_root: legacy_root.into(),
             modern_root: modern_root.into(),
             ast_parsing_skill,
+            sandbox_skill,
             shadow_test_skill,
             llm_client,
         }
@@ -105,6 +109,34 @@ impl VerifierAgent {
                 )
             }
         };
+
+        if should_use_sandbox_verification(ticket) {
+            info!(
+                ticket_id = ticket.id.as_str(),
+                "Verifier selected sandbox-only validation because the ticket does not expose a shadow-executable modern target"
+            );
+            let sandbox_result = self.execute_generated_tests(ticket).await?;
+            ticket.last_ast_diff = Some(ast_diff.clone());
+
+            if sandbox_result.exit_code == 0 {
+                info!(
+                    ticket_id = ticket.id.as_str(),
+                    command = sandbox_result.command.as_str(),
+                    "Verifier accepted generated code after sandbox test execution"
+                );
+                ticket.status = TicketStatus::Verified;
+                return Ok(ticket.clone());
+            }
+
+            let failure_reason = build_sandbox_failure_summary(&sandbox_result, &ast_diff);
+            error!(
+                ticket_id = ticket.id.as_str(),
+                failure = failure_reason.as_str(),
+                "Verifier rejected generated artifacts after sandbox test execution"
+            );
+            ticket.status = TicketStatus::Failed(failure_reason);
+            return Ok(ticket.clone());
+        }
 
         let structured_call = self
             .llm_client
@@ -189,6 +221,22 @@ impl VerifierAgent {
         serde_json::from_str(&raw_diff).context("failed to deserialize shadow execution diff")
     }
 
+    async fn execute_generated_tests(&self, ticket: &Ticket) -> Result<TerminalCommandOutput> {
+        ensure!(
+            !ticket.test_file_paths.is_empty(),
+            "ticket {} does not have any generated tests to execute",
+            ticket.id
+        );
+
+        let mut args = vec![self.modern_root.to_string_lossy().into_owned()];
+        args.extend(ticket.test_file_paths.iter().cloned());
+        let raw_output =
+            self.sandbox_skill.execute(args).await.with_context(|| {
+                format!("sandbox test execution failed for ticket {}", ticket.id)
+            })?;
+        serde_json::from_str(&raw_output).context("failed to deserialize sandbox execution output")
+    }
+
     fn system_prompt(&self, ticket: &Ticket) -> String {
         format!(
             concat!(
@@ -197,13 +245,19 @@ impl VerifierAgent {
                 "You must respond by calling the provided tool exactly once.\n",
                 "Rules:\n",
                 "1. Select one callable entry point from the supplied legacy files and one callable entry point from the supplied modern files.\n",
-                "2. Generate JSON fixtures that stress happy paths, boundary values, nullability, malformed inputs, and branch-heavy edge cases.\n",
-                "3. Every fixture must use positional `args` only.\n",
-                "4. Prefer fixtures that exercise every branch visible in the legacy AST.\n",
-                "5. Use only the file paths explicitly provided in the prompt.\n",
-                "6. Do not emit prose, markdown, or explanations.\n"
+                "2. Only choose JavaScript, TypeScript, TSX, Python, or Go source files. Never choose configuration or manifest files such as package.json or tsconfig.json.\n",
+                "3. Prefer callables that are exported or otherwise directly reachable from module scope without editing the source files.\n",
+                "4. If the legacy module is CommonJS and the callable is a top-level function declaration, you may target that function name directly.\n",
+                "5. Generate between 3 and {max_fixtures} JSON fixtures total. Prefer the smallest set that still covers the happy path, not-found behavior, nullability, one malformed input, and one boundary case.\n",
+                "6. Every fixture must use positional `args` only.\n",
+                "7. If the selected callable expects a callback argument, represent that callback position as {{\"capture\":\"callback\"}}. Do not use null, undefined, functions, or prose for callback placeholders.\n",
+                "8. Do not use undefined, NaN, Infinity, symbols, or any non-JSON values anywhere in `args`.\n",
+                "9. Prefer fixtures that exercise every branch visible in the legacy AST.\n",
+                "10. Use only the file paths explicitly provided in the prompt.\n",
+                "11. Do not emit prose, markdown, or explanations.\n"
             ),
-            framework = ticket.target_framework
+            framework = ticket.target_framework,
+            max_fixtures = MAX_SHADOW_FIXTURES
         )
     }
 
@@ -247,6 +301,8 @@ impl VerifierAgent {
                     "modern_target": execution_target_schema(),
                     "fixtures": {
                         "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_SHADOW_FIXTURES,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -375,14 +431,75 @@ fn build_failure_summary(execution_diff: &ExecutionDiff, ast_diff: &AstDiff) -> 
     }
 }
 
+fn build_sandbox_failure_summary(output: &TerminalCommandOutput, ast_diff: &AstDiff) -> String {
+    let mut details = Vec::new();
+    details.push(format!(
+        "sandbox test command failed with exit code {}",
+        output.exit_code
+    ));
+
+    if !output.stderr.trim().is_empty() {
+        details.push(format!("stderr: {}", truncate_for_summary(&output.stderr)));
+    } else if !output.stdout.trim().is_empty() {
+        details.push(format!("stdout: {}", truncate_for_summary(&output.stdout)));
+    }
+
+    if !ast_diff.is_empty() {
+        details.push(format!(
+            "ast_diff: missing_functions={}, missing_classes={}, missing_imports={}, missing_branches={}",
+            ast_diff.missing_functions.len(),
+            ast_diff.missing_classes.len(),
+            ast_diff.missing_imports.len(),
+            ast_diff.missing_branches.len()
+        ));
+    }
+
+    details.join(" | ")
+}
+
+fn should_use_sandbox_verification(ticket: &Ticket) -> bool {
+    !ticket
+        .modern_file_paths
+        .iter()
+        .any(|path| is_shadow_executable_path(path))
+}
+
+fn is_shadow_executable_path(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("js") | Some("mjs") | Some("cjs") | Some("ts") | Some("tsx") | Some("py") | Some("go")
+    )
+}
+
+fn truncate_for_summary(value: &str) -> String {
+    const MAX_SUMMARY_CHARS: usize = 240;
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= MAX_SUMMARY_CHARS {
+        trimmed.to_owned()
+    } else {
+        let truncated = trimmed.chars().take(MAX_SUMMARY_CHARS).collect::<String>();
+        format!("{truncated}...")
+    }
+}
+
 fn normalize_relative_path(path: &str) -> Result<String> {
     normalize_portable_relative_path(path, "file path").map(|path| path.into_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ShadowFixturePlan, build_failure_summary};
-    use crate::skills::{AstDiff, ExecutionDiff, ExecutionTarget, ShadowFixture};
+    use super::{
+        ShadowFixturePlan, build_failure_summary, is_shadow_executable_path,
+        should_use_sandbox_verification,
+    };
+    use crate::agents::{Ticket, TicketStatus, TicketTokenUsage};
+    use crate::skills::{
+        AstDiff, ExecutionDiff, ExecutionTarget, ShadowFixture, TerminalCommandOutput,
+    };
 
     #[test]
     fn shadow_fixture_plan_round_trips() {
@@ -426,5 +543,41 @@ mod tests {
         let summary = build_failure_summary(&execution_diff, &ast_diff);
         assert!(summary.contains("return value mismatch"));
         assert!(summary.contains("ast_diff"));
+    }
+
+    #[test]
+    fn sandbox_verification_detects_non_executable_modern_outputs() {
+        let ticket = Ticket {
+            id: "CFG-001".to_owned(),
+            description: "baseline".to_owned(),
+            context_files: vec!["server.js".to_owned()],
+            status: TicketStatus::InProgress,
+            legacy_code_snippet: "baseline".to_owned(),
+            target_framework: "TypeScript".to_owned(),
+            dependencies: vec!["typescript".to_owned()],
+            modern_file_paths: vec!["tsconfig.json".to_owned(), "package.json".to_owned()],
+            test_file_paths: vec!["tests/migration_smoke.test.ts".to_owned()],
+            retries: 0,
+            token_usage: TicketTokenUsage::default(),
+            last_execution_diff: None,
+            last_ast_diff: None,
+        };
+
+        assert!(should_use_sandbox_verification(&ticket));
+        assert!(!is_shadow_executable_path("package.json"));
+        assert!(is_shadow_executable_path("tests/migration_smoke.test.ts"));
+    }
+
+    #[test]
+    fn sandbox_failure_summary_includes_exit_code_and_output() {
+        let output = TerminalCommandOutput {
+            command: "node --test".to_owned(),
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "test failed".to_owned(),
+        };
+        let summary = super::build_sandbox_failure_summary(&output, &AstDiff::default());
+        assert!(summary.contains("exit code 1"));
+        assert!(summary.contains("test failed"));
     }
 }

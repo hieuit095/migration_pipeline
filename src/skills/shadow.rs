@@ -82,7 +82,7 @@ pub struct ShadowTestSkill {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShadowRuntime {
     Node,
-    Deno,
+    NodeTypeScript,
     Python,
 }
 
@@ -195,6 +195,19 @@ impl Skill for ShadowTestSkill {
     async fn execute(&self, args: Vec<String>) -> Result<String> {
         let request = parse_request(&args)?;
         validate_request(&request)?;
+        let execution_result = self.execute_request(&request).await;
+        match execution_result {
+            Ok(raw_diff) => Ok(raw_diff),
+            Err(error) => {
+                warn!(error = %error, "Shadow test execution failed before a complete diff could be produced");
+                serialize_execution_diff(&fatal_execution_diff(&request, error))
+            }
+        }
+    }
+}
+
+impl ShadowTestSkill {
+    async fn execute_request(&self, request: &ShadowTestRequest) -> Result<String> {
         self.sandbox_skill.ensure_docker_ready().await?;
         let legacy_root = PathBuf::from(&request.legacy_root);
         let modern_root = PathBuf::from(&request.modern_root);
@@ -206,12 +219,14 @@ impl Skill for ShadowTestSkill {
             &request.modern_target.relative_path,
             "shadow execution target",
         )?;
+        let legacy_runtime = ShadowRuntime::from_path(&legacy_relative)?;
+        let modern_runtime = ShadowRuntime::from_path(&modern_relative)?;
         let legacy_environment = self
             .sandbox_skill
             .prepare_execution_environment(
                 "shadow-legacy",
                 &legacy_root,
-                ShadowRuntime::from_path(&legacy_relative)?.sandbox_runtime(),
+                legacy_runtime.sandbox_runtime(),
                 std::slice::from_ref(&legacy_relative),
             )
             .await?;
@@ -220,7 +235,7 @@ impl Skill for ShadowTestSkill {
             .prepare_execution_environment(
                 "shadow-modern",
                 &modern_root,
-                ShadowRuntime::from_path(&modern_relative)?.sandbox_runtime(),
+                modern_runtime.sandbox_runtime(),
                 std::slice::from_ref(&modern_relative),
             )
             .await?;
@@ -247,8 +262,28 @@ impl Skill for ShadowTestSkill {
                     )
                 );
 
-                let legacy_record = legacy_result?;
-                let modern_record = modern_result?;
+                let legacy_record = match legacy_result {
+                    Ok(record) => record,
+                    Err(error) => {
+                        warn!(
+                            fixture_id = fixture.id.as_str(),
+                            error = %error,
+                            "Shadow execution failed for legacy target"
+                        );
+                        synthetic_execution_record("legacy", error)
+                    }
+                };
+                let modern_record = match modern_result {
+                    Ok(record) => record,
+                    Err(error) => {
+                        warn!(
+                            fixture_id = fixture.id.as_str(),
+                            error = %error,
+                            "Shadow execution failed for modern target"
+                        );
+                        synthetic_execution_record("modern", error)
+                    }
+                };
                 let fixture_diff = compare_fixture(fixture.clone(), legacy_record, modern_record);
                 sandbox_execution_errors.extend(
                     fixture_diff
@@ -264,16 +299,13 @@ impl Skill for ShadowTestSkill {
                 }
             }
 
-            let equivalent = fixture_diffs.iter().all(|fixture_diff| {
-                fixture_diff.output_matches && !fixture_diff.performance_regression
-            }) && sandbox_execution_errors.is_empty();
-
-            serde_json::to_string(&ExecutionDiff {
-                equivalent,
+            serialize_execution_diff(&ExecutionDiff {
+                equivalent: fixture_diffs.iter().all(|fixture_diff| {
+                    fixture_diff.output_matches && !fixture_diff.performance_regression
+                }) && sandbox_execution_errors.is_empty(),
                 fixture_diffs,
                 sandbox_execution_errors,
             })
-            .context("failed to serialize shadow execution diff")
         }
         .await;
 
@@ -490,6 +522,52 @@ fn compare_fixture(
     }
 }
 
+fn synthetic_execution_record(label: &str, error: anyhow::Error) -> ExecutionRecord {
+    ExecutionRecord {
+        target: label.to_owned(),
+        exit_code: -1,
+        stdout: String::new(),
+        duration_ms: 0,
+        error: Some(format_error_chain(&error)),
+        ..Default::default()
+    }
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+fn fatal_execution_diff(request: &ShadowTestRequest, error: anyhow::Error) -> ExecutionDiff {
+    let fixture = request.fixtures.first().cloned().unwrap_or_default();
+    let error_message = format_error_chain(&error);
+    let legacy = synthetic_execution_record("legacy", anyhow::anyhow!(error_message.clone()));
+    let modern = synthetic_execution_record("modern", anyhow::anyhow!(error_message.clone()));
+    let differences = vec![format!(
+        "shadow execution infrastructure failed before fixture execution: {error_message}"
+    )];
+
+    ExecutionDiff {
+        equivalent: false,
+        fixture_diffs: vec![FixtureDiff {
+            fixture,
+            legacy,
+            modern,
+            output_matches: false,
+            performance_regression: false,
+            differences: differences.clone(),
+        }],
+        sandbox_execution_errors: differences,
+    }
+}
+
+fn serialize_execution_diff(diff: &ExecutionDiff) -> Result<String> {
+    serde_json::to_string(diff).context("failed to serialize shadow execution diff")
+}
+
 fn should_fail_fast(fixture_diff: &FixtureDiff) -> bool {
     !fixture_diff.output_matches || fixture_diff.performance_regression
 }
@@ -551,7 +629,7 @@ impl ShadowRuntime {
             .as_deref()
         {
             Some("js") | Some("mjs") | Some("cjs") => Ok(Self::Node),
-            Some("ts") | Some("tsx") => Ok(Self::Deno),
+            Some("ts") | Some("tsx") => Ok(Self::NodeTypeScript),
             Some("py") => Ok(Self::Python),
             Some(other) => bail!(
                 "ShadowTestSkill does not support the `.{other}` extension for shadow execution yet"
@@ -580,14 +658,13 @@ impl ShadowRuntime {
                     fixture_path.to_owned(),
                 ],
             ),
-            Self::Deno => (
-                format!("{runner_label}_shadow_runner.ts"),
-                DENO_SHADOW_RUNNER,
+            Self::NodeTypeScript => (
+                format!("{runner_label}_shadow_runner.mjs"),
+                NODE_SHADOW_RUNNER,
                 vec![
-                    "deno".to_owned(),
-                    "run".to_owned(),
-                    "--allow-read".to_owned(),
-                    format!("{SHADOW_MOUNT_POINT}/{runner_label}_shadow_runner.ts"),
+                    "node".to_owned(),
+                    "--import=tsx".to_owned(),
+                    format!("{SHADOW_MOUNT_POINT}/{runner_label}_shadow_runner.mjs"),
                     module_path.to_owned(),
                     callable.to_owned(),
                     fixture_path.to_owned(),
@@ -610,7 +687,7 @@ impl ShadowRuntime {
     fn sandbox_runtime(self) -> SandboxRuntime {
         match self {
             Self::Node => SandboxRuntime::Node,
-            Self::Deno => SandboxRuntime::Deno,
+            Self::NodeTypeScript => SandboxRuntime::NodeTypeScript,
             Self::Python => SandboxRuntime::Python,
         }
     }
@@ -618,11 +695,111 @@ impl ShadowRuntime {
 
 const NODE_SHADOW_RUNNER: &str = r#"
 import fs from 'node:fs/promises';
+import Module from 'node:module';
+import path from 'node:path';
 import { performance } from 'node:perf_hooks';
+import vm from 'node:vm';
+
+const CALLBACK_WAIT_MS = 250;
+const CALLBACK_TIMEOUT = Symbol('callback-timeout');
 
 const stringify = (value) => {
   if (typeof value === 'string') return value;
   try { return JSON.stringify(value); } catch { return String(value); }
+};
+
+const toSerializable = (value) => {
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      stack: value.stack ?? null,
+    };
+  }
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'function') return `[Function ${value.name || 'anonymous'}]`;
+  if (Array.isArray(value)) return value.map((item) => toSerializable(item));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nested]) => [key, toSerializable(nested)])
+    );
+  }
+  return value ?? null;
+};
+
+const isCallbackPlaceholder = (value) =>
+  value === null ||
+  (value &&
+    typeof value === 'object' &&
+    (value.capture === 'callback' || value.__fn__ === true));
+
+const serializeCallbackArgs = (callbackArgs) => {
+  if (callbackArgs.length === 0) return null;
+  if (callbackArgs.length === 1) return toSerializable(callbackArgs[0]);
+  return callbackArgs.map((argument) => toSerializable(argument));
+};
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const resolveCallable = (moduleNamespace, callableName) => {
+  if (callableName === 'default' && typeof moduleNamespace.default === 'function') {
+    return moduleNamespace.default;
+  }
+
+  const candidates = [
+    moduleNamespace[callableName],
+    moduleNamespace.default?.[callableName],
+  ];
+
+  return candidates.find((candidate) => typeof candidate === 'function') ?? null;
+};
+
+const SAFE_IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+const resolveCommonJsCallable = async (modulePath, callableName) => {
+  if (!SAFE_IDENTIFIER.test(callableName)) {
+    return null;
+  }
+
+  const source = await fs.readFile(modulePath, 'utf8');
+  const wrappedSource = `
+(function (exports, require, module, __filename, __dirname) {
+${source}
+const __shadowCandidates = [
+  typeof ${callableName} === 'function' ? ${callableName} : null,
+  module.exports?.[${JSON.stringify(callableName)}],
+  module.exports?.default?.[${JSON.stringify(callableName)}],
+  ${JSON.stringify(callableName)} === 'default' && typeof module.exports === 'function'
+    ? module.exports
+    : null,
+  ${JSON.stringify(callableName)} === 'default' && typeof module.exports?.default === 'function'
+    ? module.exports.default
+    : null
+];
+return __shadowCandidates.find((candidate) => typeof candidate === 'function') ?? null;
+})
+`;
+  const compiled = vm.runInThisContext(wrappedSource, { filename: modulePath });
+  const module = { exports: {} };
+  const require = Module.createRequire(`file://${modulePath}`);
+  return compiled(module.exports, require, module, modulePath, path.dirname(modulePath));
+};
+
+const loadCallable = async (modulePath, callableName) => {
+  const extension = path.extname(modulePath).toLowerCase();
+  if (extension === '.js' || extension === '.cjs') {
+    try {
+      return await resolveCommonJsCallable(modulePath, callableName);
+    } catch (commonJsError) {
+      const errorText = String(commonJsError?.message ?? commonJsError);
+      if (!/Unexpected token 'export'|Cannot use import statement outside a module/.test(errorText)) {
+        throw commonJsError;
+      }
+    }
+  }
+
+  const module = await import(`file://${modulePath}`);
+  return resolveCallable(module, callableName);
 };
 
 const captureConsole = () => {
@@ -638,89 +815,61 @@ const captureConsole = () => {
 const [, , modulePath, callableName, fixturePath] = process.argv;
 const fixture = JSON.parse(await fs.readFile(fixturePath, 'utf8'));
 const captured = captureConsole();
-const startedAt = performance.now();
+let startedAt = performance.now();
 let exitCode = 0;
 let returnValue = null;
 let error = null;
 
 try {
-  const module = await import(`file://${modulePath}`);
-  const callable = callableName === 'default' ? module.default : module[callableName];
+  const callable = await loadCallable(modulePath, callableName);
   if (typeof callable !== 'function') {
     throw new Error(`callable ${callableName} was not found in ${modulePath}`);
   }
-  returnValue = await callable(...(fixture.args ?? []));
+
+  captured.stdout.length = 0;
+  captured.stderr.length = 0;
+  startedAt = performance.now();
+
+  const args = Array.isArray(fixture.args) ? [...fixture.args] : [];
+  let callbackPromise = null;
+  if (args.length > 0 && isCallbackPlaceholder(args.at(-1))) {
+    callbackPromise = new Promise((resolve) => {
+      args[args.length - 1] = (...callbackArgs) => {
+        resolve(serializeCallbackArgs(callbackArgs));
+      };
+    });
+  }
+
+  const directResult = await callable(...args);
+  if (callbackPromise) {
+    const callbackResult = await Promise.race([
+      callbackPromise,
+      wait(CALLBACK_WAIT_MS).then(() => CALLBACK_TIMEOUT),
+    ]);
+    returnValue =
+      callbackResult === CALLBACK_TIMEOUT
+        ? toSerializable(directResult)
+        : callbackResult;
+  } else {
+    returnValue = toSerializable(directResult);
+  }
 } catch (failure) {
   exitCode = 1;
   error = String(failure?.stack ?? failure);
   captured.stderr.push(error);
-} finally {
-  captured.restore();
 }
 
-process.stdout.write(JSON.stringify({
+await new Promise((resolve, reject) => {
+  process.stdout.write(JSON.stringify({
   exit_code: exitCode,
   stdout: captured.stdout.join('\n'),
   stderr: captured.stderr.join('\n'),
   return_value: returnValue,
   duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
   error,
-}));
-process.exitCode = exitCode;
-"#;
-
-const DENO_SHADOW_RUNNER: &str = r#"
-const stringify = (value: unknown): string => {
-  if (typeof value === "string") return value;
-  try { return JSON.stringify(value); } catch { return String(value); }
-};
-
-const captureConsole = () => {
-  const stdout: string[] = [];
-  const stderr: string[] = [];
-  const original = { log: console.log, warn: console.warn, error: console.error };
-  console.log = (...args: unknown[]) => stdout.push(args.map(stringify).join(" "));
-  console.warn = (...args: unknown[]) => stderr.push(args.map(stringify).join(" "));
-  console.error = (...args: unknown[]) => stderr.push(args.map(stringify).join(" "));
-  return { stdout, stderr, restore: () => { console.log = original.log; console.warn = original.warn; console.error = original.error; } };
-};
-
-const [modulePath, callableName, fixturePath] = Deno.args;
-const fixture = JSON.parse(await Deno.readTextFile(fixturePath));
-const captured = captureConsole();
-const startedAt = performance.now();
-let exitCode = 0;
-let returnValue: unknown = null;
-let error: string | null = null;
-
-try {
-  const module = await import(`file://${modulePath}`);
-  const callable = callableName === "default" ? module.default : module[callableName];
-  if (typeof callable !== "function") {
-    throw new Error(`callable ${callableName} was not found in ${modulePath}`);
-  }
-  returnValue = await callable(...(fixture.args ?? []));
-} catch (failure) {
-  exitCode = 1;
-  error = failure instanceof Error ? (failure.stack ?? failure.message) : String(failure);
-  captured.stderr.push(error);
-} finally {
-  captured.restore();
-}
-
-await Deno.stdout.write(
-  new TextEncoder().encode(
-    JSON.stringify({
-      exit_code: exitCode,
-      stdout: captured.stdout.join("\n"),
-      stderr: captured.stderr.join("\n"),
-      return_value: returnValue,
-      duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-      error,
-    }),
-  ),
-);
-Deno.exit(exitCode);
+  }), (writeError) => writeError ? reject(writeError) : resolve());
+});
+process.exit(exitCode);
 "#;
 
 const PYTHON_SHADOW_RUNNER: &str = r#"
@@ -777,7 +926,9 @@ mod tests {
     use super::{
         ExecutionRecord, ExecutionTarget, FixtureDiff, ShadowFixture, ShadowRuntime,
         ShadowTestRequest, compare_fixture, is_critical_performance_regression, should_fail_fast,
+        synthetic_execution_record,
     };
+    use anyhow::anyhow;
     use serde_json::json;
 
     #[test]
@@ -883,6 +1034,30 @@ mod tests {
         };
 
         assert!(!should_fail_fast(&fixture_diff));
+    }
+
+    #[test]
+    fn synthetic_execution_record_surfaces_runner_failure_in_fixture_diff() {
+        let fixture = ShadowFixture {
+            id: "fx-runner".to_owned(),
+            description: "runner failure".to_owned(),
+            args: Vec::new(),
+        };
+        let legacy = synthetic_execution_record("legacy", anyhow!("docker timeout"));
+        let modern = ExecutionRecord {
+            target: "modern".to_owned(),
+            exit_code: 0,
+            ..Default::default()
+        };
+
+        let diff = compare_fixture(fixture, legacy, modern);
+
+        assert!(!diff.output_matches);
+        assert!(
+            diff.differences
+                .iter()
+                .any(|difference| difference.contains("legacy runner error: docker timeout"))
+        );
     }
 
     #[test]

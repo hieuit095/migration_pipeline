@@ -70,7 +70,11 @@ impl BlueprinterAgent {
         self.llm_client.provider_for(TaskKind::Blueprinter)
     }
 
-    pub async fn generate_blueprint(&self, legacy_dir_path: &str) -> Result<Vec<Ticket>> {
+    pub async fn generate_blueprint(
+        &self,
+        legacy_dir_path: &str,
+        global_target_framework: &str,
+    ) -> Result<Vec<Ticket>> {
         let dependency_graph = self
             .ast_parsing_skill
             .execute(vec![legacy_dir_path.to_owned()])
@@ -96,7 +100,7 @@ impl BlueprinterAgent {
             .system_prompt()
             .context("failed to render blueprinter system prompt")?;
         let user_prompt = self
-            .user_prompt(legacy_dir_path, &dependency_graph)
+            .user_prompt(legacy_dir_path, global_target_framework, &dependency_graph)
             .await
             .context("failed to render blueprinter user prompt")?;
 
@@ -119,7 +123,15 @@ impl BlueprinterAgent {
         );
 
         let payload: BlueprintPayload = structured_call.deserialize_arguments()?;
-        Ok(payload.tickets.into_iter().map(Ticket::from).collect())
+        Ok(payload
+            .tickets
+            .into_iter()
+            .map(Ticket::from)
+            .map(|mut ticket| {
+                ticket.target_framework = global_target_framework.to_owned();
+                ticket
+            })
+            .collect())
     }
 
     fn system_prompt(&self) -> Result<String> {
@@ -129,15 +141,19 @@ impl BlueprinterAgent {
     async fn user_prompt(
         &self,
         legacy_dir_path: &str,
+        global_target_framework: &str,
         dependency_graph: &PromptContext,
     ) -> Result<String> {
         let prefix = format!(
             concat!(
                 "Analyze the legacy codebase dependency graph below and create a migration blueprint.\n",
+                "The user has explicitly requested to migrate this entire project to: **{global_target_framework}**. ",
+                "You MUST enforce this as the `target_framework` field for ALL generated tickets.\n",
                 "Legacy directory: {legacy_dir_path}\n",
                 "Dependency graph JSON:\n"
             ),
-            legacy_dir_path = legacy_dir_path
+            legacy_dir_path = legacy_dir_path,
+            global_target_framework = global_target_framework
         );
         let mut prompt =
             String::with_capacity(prefix.len() + dependency_graph.byte_len_hint().await? + 1);

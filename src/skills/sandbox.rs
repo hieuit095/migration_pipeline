@@ -71,6 +71,8 @@ struct DockerCleanupReaper {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SandboxRuntime {
     Node,
+    NodeTypeScript,
+    #[allow(dead_code)]
     Deno,
     Python,
     Go,
@@ -461,7 +463,7 @@ impl SandboxRuntime {
             .as_deref()
         {
             Some("js") | Some("mjs") | Some("cjs") => Ok(Self::Node),
-            Some("ts") | Some("tsx") => Ok(Self::Deno),
+            Some("ts") | Some("tsx") => Ok(Self::NodeTypeScript),
             Some("py") => Ok(Self::Python),
             Some("go") => Ok(Self::Go),
             Some(other) => Err(anyhow!(
@@ -475,7 +477,7 @@ impl SandboxRuntime {
 
     fn base_image(self) -> &'static str {
         match self {
-            Self::Node => "node:alpine",
+            Self::Node | Self::NodeTypeScript => "node:alpine",
             Self::Deno => "denoland/deno:alpine",
             Self::Python => "python:alpine",
             Self::Go => "golang:alpine",
@@ -486,6 +488,15 @@ impl SandboxRuntime {
         match self {
             Self::Node => {
                 let mut command = vec!["node".to_owned(), "--test".to_owned()];
+                command.extend(container_paths.iter().cloned());
+                command
+            }
+            Self::NodeTypeScript => {
+                let mut command = vec![
+                    "node".to_owned(),
+                    "--import=tsx".to_owned(),
+                    "--test".to_owned(),
+                ];
                 command.extend(container_paths.iter().cloned());
                 command
             }
@@ -529,6 +540,22 @@ impl SandboxRuntime {
                     Ok(None)
                 }
             }
+            Self::NodeTypeScript => {
+                let has_package_manifest = source_root.join("package.json").is_file();
+                let mut commands = Vec::new();
+                if has_package_manifest {
+                    commands.push("npm install --ignore-scripts --no-audit --no-fund".to_owned());
+                }
+                if has_typescript_execution_paths(execution_paths) {
+                    commands.push("npm install --no-save tsx".to_owned());
+                }
+
+                if commands.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(commands.join(" && ")))
+                }
+            }
             Self::Deno => Ok(Some(build_deno_cache_command(execution_paths))),
             Self::Python => {
                 if source_root.join("requirements.txt").is_file() {
@@ -552,6 +579,17 @@ impl SandboxRuntime {
             }
         }
     }
+}
+
+fn has_typescript_execution_paths(execution_paths: &[Utf8PathBuf]) -> bool {
+    execution_paths.iter().any(|path| {
+        matches!(
+            path.extension()
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref(),
+            Some("ts") | Some("tsx")
+        )
+    })
 }
 
 #[async_trait]

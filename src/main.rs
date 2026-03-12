@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use dotenv::dotenv;
 use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -11,6 +10,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 mod agents;
+mod cli;
 mod config;
 mod pipeline;
 mod prompts;
@@ -21,35 +21,55 @@ use agents::{
     Agent, BlueprinterAgent, ExecutorAgent, SurgeonAgent, Ticket, TicketStatus, TicketTokenUsage,
     VerifierAgent,
 };
+use cli::StartMigrationConfig;
 use config::{DockerSandboxConfig, ModelRouter, TaskKind, ZeroClawClient};
-use skills::{ASTParsingSkill, FileIOSkill, FileWriteSkill, ShadowTestSkill, Skill};
+use skills::{ASTParsingSkill, FileIOSkill, FileWriteSkill, SandboxSkill, ShadowTestSkill, Skill};
 use utils::state::{load_state, save_state};
 
 const MAX_SURGERY_RETRIES: u8 = 3;
 const STATE_FILE: &str = ".migration_state.db";
 const MAX_CONCURRENT_TICKETS_ENV: &str = "MAX_CONCURRENT_TICKETS";
 const DEFAULT_MAX_CONCURRENT_TICKETS: usize = 3;
+const PIPELINE_TARGET_FRAMEWORK_ENV: &str = "PIPELINE_TARGET_FRAMEWORK";
+const DEFAULT_TARGET_FRAMEWORK: &str = "TypeScript on Node.js LTS";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _guard = utils::setup_telemetry()?;
     dotenv().ok();
-
-    info!("Starting AI-Powered Legacy Code Migration Pipeline");
-
     let startup_root =
         std::env::current_dir().context("failed to resolve startup working directory")?;
-    let legacy_root = resolve_project_root(&startup_root, Path::new("./legacy_app"), false)?;
-    let modern_root = resolve_project_root(&startup_root, Path::new("./modern_app"), true)?;
+    let Some(StartMigrationConfig {
+        legacy_root,
+        modern_root,
+    }) = cli::run_cli(&startup_root)?
+    else {
+        return Ok(());
+    };
+
+    run_pipeline(legacy_root, modern_root).await
+}
+
+async fn run_pipeline(legacy_root: PathBuf, modern_root: PathBuf) -> Result<()> {
+    let target_framework = target_framework_from_env();
+    let telemetry_guard = utils::setup_telemetry()?;
+    info!("Starting AI-Powered Legacy Code Migration Pipeline");
+    info!(
+        legacy_root = %legacy_root.display(),
+        modern_root = %modern_root.display(),
+        target_framework = target_framework.as_str(),
+        "Resolved migration configuration"
+    );
 
     let ast_parsing_skill: Arc<dyn Skill> = Arc::new(ASTParsingSkill);
     let file_io_skill: Arc<dyn Skill> = Arc::new(FileIOSkill);
     let file_write_skill: Arc<dyn Skill> = Arc::new(FileWriteSkill);
     let docker_sandbox_config = DockerSandboxConfig::from_env()?;
+    let sandbox_skill: Arc<dyn Skill> = Arc::new(SandboxSkill::new(docker_sandbox_config.clone()));
     let shadow_test_skill: Arc<dyn Skill> = Arc::new(ShadowTestSkill::new(docker_sandbox_config));
     let ast_parsing_name = ast_parsing_skill.name().to_owned();
     let file_io_name = file_io_skill.name().to_owned();
     let file_write_name = file_write_skill.name().to_owned();
+    let sandbox_name = sandbox_skill.name().to_owned();
     let shadow_test_name = shadow_test_skill.name().to_owned();
     let task_configs = vec![
         ModelRouter::from_env(TaskKind::Blueprinter, BlueprinterAgent::default_model())?,
@@ -71,6 +91,7 @@ async fn main() -> Result<()> {
         legacy_root.clone(),
         modern_root.clone(),
         Arc::clone(&ast_parsing_skill),
+        Arc::clone(&sandbox_skill),
         Arc::clone(&shadow_test_skill),
         Arc::clone(&llm_client),
     ));
@@ -95,7 +116,7 @@ async fn main() -> Result<()> {
         model = executor.model(),
         file_io = file_io_name.as_str(),
         file_write = file_write_name.as_str(),
-        output_root = modern_root.to_string_lossy().as_ref(),
+        output_root = %modern_root.display(),
         "Initialized phase-2 executor pipeline"
     );
     info!(
@@ -103,8 +124,9 @@ async fn main() -> Result<()> {
         provider = verifier.provider(),
         model = verifier.model(),
         ast_parsing = ast_parsing_name.as_str(),
+        sandbox = sandbox_name.as_str(),
         shadow_test = shadow_test_name.as_str(),
-        output_root = modern_root.to_string_lossy().as_ref(),
+        output_root = %modern_root.display(),
         "Initialized phase-3 verifier pipeline with shadow testing"
     );
     info!(
@@ -127,7 +149,10 @@ async fn main() -> Result<()> {
         }
         None => {
             let tickets = blueprinter
-                .generate_blueprint(legacy_root.to_string_lossy().as_ref())
+                .generate_blueprint(
+                    legacy_root.to_string_lossy().as_ref(),
+                    target_framework.as_str(),
+                )
                 .await?;
             debug!(tickets = ?tickets, "Generated migration blueprint payload");
             info!(
@@ -224,7 +249,31 @@ async fn main() -> Result<()> {
         "Aggregated pipeline token usage"
     );
 
+    let failed_tickets = final_state
+        .iter()
+        .filter(|ticket| matches!(ticket.status, TicketStatus::Failed(_)))
+        .count();
+    if failed_tickets > 0 {
+        error!(
+            failed_tickets,
+            total_tickets = final_state.len(),
+            state_file = STATE_FILE,
+            "Pipeline finished with failed tickets"
+        );
+        drop(telemetry_guard);
+        std::thread::sleep(Duration::from_millis(500));
+        std::process::exit(1);
+    }
+
+    drop(telemetry_guard);
     Ok(())
+}
+
+fn target_framework_from_env() -> String {
+    env::var(PIPELINE_TARGET_FRAMEWORK_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_TARGET_FRAMEWORK.to_owned())
 }
 
 async fn run_ticket_feedback_loop(
@@ -254,6 +303,15 @@ async fn run_ticket_feedback_loop(
                 publish_ticket_state(&state_tx, &ticket).await?;
             }
             TicketStatus::Failed(reason) if ticket.retries < MAX_SURGERY_RETRIES => {
+                if !ticket_has_generated_artifacts(&ticket) {
+                    error!(
+                        ticket_id = ticket.id.as_str(),
+                        retries = ticket.retries,
+                        failure = reason.as_str(),
+                        "Ticket failed before artifacts were generated; skipping surgeon"
+                    );
+                    return Ok(ticket);
+                }
                 warn!(
                     ticket_id = ticket.id.as_str(),
                     retries = ticket.retries,
@@ -375,6 +433,10 @@ fn summarize_token_usage(tickets: &[Ticket]) -> TicketTokenUsage {
         })
 }
 
+fn ticket_has_generated_artifacts(ticket: &Ticket) -> bool {
+    !ticket.modern_file_paths.is_empty() || !ticket.test_file_paths.is_empty()
+}
+
 fn max_concurrent_tickets_from_env() -> Result<usize> {
     match env::var(MAX_CONCURRENT_TICKETS_ENV) {
         Ok(value) if !value.trim().is_empty() => {
@@ -396,51 +458,19 @@ fn max_concurrent_tickets_from_env() -> Result<usize> {
     }
 }
 
-fn resolve_project_root(
-    startup_root: &Path,
-    configured_path: &Path,
-    create_if_missing: bool,
-) -> Result<PathBuf> {
-    let absolute_path = if configured_path.is_absolute() {
-        configured_path.to_path_buf()
-    } else {
-        startup_root.join(configured_path)
-    };
-
-    if create_if_missing {
-        fs::create_dir_all(&absolute_path).with_context(|| {
-            format!(
-                "failed to create required project directory {}",
-                absolute_path.display()
-            )
-        })?;
-    }
-
-    ensure!(
-        absolute_path.exists(),
-        "required project directory does not exist: {}",
-        absolute_path.display()
-    );
-    ensure!(
-        absolute_path.is_dir(),
-        "required project path is not a directory: {}",
-        absolute_path.display()
-    );
-
-    Ok(absolute_path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        load_state_blocking, max_concurrent_tickets_from_env, resolve_project_root,
-        run_state_writer_with_flush_interval,
+        load_state_blocking, max_concurrent_tickets_from_env, run_state_writer_with_flush_interval,
     };
     use crate::agents::{Ticket, TicketStatus, TicketTokenUsage};
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn make_temp_state_path(prefix: &str) -> (PathBuf, PathBuf) {
         let unique_id = SystemTime::now()
@@ -551,21 +581,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_project_root_uses_startup_directory_once() {
-        let (root, _) = make_temp_state_path("migration_pipeline_root_resolution");
-        let legacy_root = root.join("legacy_app");
-        fs::create_dir_all(&legacy_root).expect("legacy root should be created");
-
-        let resolved = resolve_project_root(&root, Path::new("legacy_app"), false)
-            .expect("legacy root should resolve");
-
-        assert_eq!(resolved, legacy_root);
-
-        fs::remove_dir_all(root).expect("temp directory should be removed");
-    }
-
-    #[test]
     fn max_concurrent_tickets_defaults_when_env_is_missing() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let previous = std::env::var(super::MAX_CONCURRENT_TICKETS_ENV).ok();
         unsafe {
             std::env::remove_var(super::MAX_CONCURRENT_TICKETS_ENV);
@@ -584,6 +601,7 @@ mod tests {
 
     #[test]
     fn max_concurrent_tickets_rejects_zero() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let previous = std::env::var(super::MAX_CONCURRENT_TICKETS_ENV).ok();
         unsafe {
             std::env::set_var(super::MAX_CONCURRENT_TICKETS_ENV, "0");
