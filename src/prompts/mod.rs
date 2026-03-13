@@ -35,3 +35,46 @@ fn prompt_environment() -> Result<Environment<'static>> {
 
     Ok(environment)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::render;
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct BlueprinterUserContext {
+        legacy_dir_path: String,
+        dependency_graph: String,
+    }
+
+    #[test]
+    fn render_blueprinter_system_template() {
+        let result = render::<()>("blueprinter/system.j2", ());
+        assert!(result.is_ok());
+        let rendered = result.unwrap();
+        assert!(rendered.contains("Staff Software Engineer"));
+        assert!(rendered.contains("legacy migrations"));
+    }
+
+    #[test]
+    fn render_blueprinter_user_template() {
+        let context = BlueprinterUserContext {
+            legacy_dir_path: "legacy_app".to_string(),
+            dependency_graph: String::from(r#"{"files": []}"#),
+        };
+        let result = render("blueprinter/user.j2", context);
+        assert!(result.is_ok());
+        let rendered = result.unwrap();
+        assert!(rendered.contains("legacy_app"));
+        let expected = r#"{"files": []}"#;
+        assert!(rendered.contains(expected));
+    }
+
+    #[test]
+    fn render_returns_error_for_nonexistent_template() {
+        let result = render::<()>("nonexistent/template.j2", ());
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("failed to load prompt template"));
+    }
+}

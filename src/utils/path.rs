@@ -121,4 +121,72 @@ mod tests {
 
         assert!(error.to_string().contains("must be absolute"));
     }
+
+    #[test]
+    fn normalize_relative_path_rejects_empty_paths() {
+        let error = normalize_relative_path("", "generated file path")
+            .expect_err("empty path should fail");
+
+        assert!(error.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn normalize_relative_path_rejects_only_whitespace_paths() {
+        let error = normalize_relative_path("   ", "generated file path")
+            .expect_err("whitespace-only path should fail");
+
+        assert!(error.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn normalize_relative_path_rejects_absolute_posix_paths() {
+        let error = normalize_relative_path("/absolute/path", "generated file path")
+            .expect_err("absolute posix path should fail");
+
+        assert!(error.to_string().contains("must be relative"));
+    }
+
+    #[test]
+    fn normalize_relative_path_rejects_parent_traversal() {
+        let error = normalize_relative_path("../escape/path", "generated file path")
+            .expect_err("parent traversal should fail");
+
+        assert!(error.to_string().contains("cannot traverse upwards"));
+    }
+
+    #[test]
+    fn normalize_relative_path_normalizes_multiple_slashes() {
+        let path = normalize_relative_path("src///lib//util", "generated file path")
+            .expect("path should normalize");
+
+        assert_eq!(path.as_str(), "src/lib/util");
+    }
+
+    #[test]
+    fn normalize_relative_path_normalizes_dot_segments() {
+        let path = normalize_relative_path("src/./lib/./util", "generated file path")
+            .expect("path should normalize");
+
+        assert_eq!(path.as_str(), "src/lib/util");
+    }
+
+    #[test]
+    fn docker_bind_mount_accepts_absolute_paths() {
+        let mount = docker_bind_mount(Path::new("/absolute/source"), "/app", false)
+            .expect("absolute path should be accepted");
+
+        assert!(mount.contains("/absolute/source"));
+        assert!(mount.contains("/app"));
+    }
+
+    #[test]
+    fn docker_bind_mount_readonly_option() {
+        let mount_readonly = docker_bind_mount(Path::new("/source"), "/app", true)
+            .expect("readonly mount should work");
+        assert!(mount_readonly.contains("readonly"));
+
+        let mount_readwrite = docker_bind_mount(Path::new("/source"), "/app", false)
+            .expect("readwrite mount should work");
+        assert!(!mount_readwrite.contains("readonly"));
+    }
 }
