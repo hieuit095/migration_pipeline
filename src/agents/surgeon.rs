@@ -1,37 +1,27 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use serde::Deserialize;
+use tokio::fs;
+use tokio::process::Command;
 use tracing::{info, warn};
-use zeroclaw::tools::ToolSpec;
 
-use crate::config::{TaskKind, ZeroClawClient};
+use crate::config::ZeroClawClient;
 use crate::skills::Skill;
-use crate::utils::path::normalize_relative_path as normalize_portable_relative_path;
 
 use super::{Agent, PromptContext, Ticket, TicketStatus};
 
 const SURGEON_NAME: &str = "surgeon";
 const DEFAULT_SURGEON_MODEL: &str = "anthropic/claude-sonnet-4.5";
 
-#[derive(Debug, Deserialize)]
-struct FixedFilesPayload {
-    files: Vec<FixedFile>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FixedFile {
-    path: String,
-    content: String,
-}
-
 pub struct SurgeonAgent {
     legacy_root: PathBuf,
     modern_root: PathBuf,
     file_io_skill: Arc<dyn Skill>,
+    #[allow(dead_code)]
     file_write_skill: Arc<dyn Skill>,
+    #[allow(dead_code)]
     llm_client: Arc<ZeroClawClient>,
 }
 
@@ -57,7 +47,7 @@ impl SurgeonAgent {
     }
 
     pub fn provider(&self) -> &str {
-        self.llm_client.provider_for(TaskKind::Surgeon)
+        "openhands"
     }
 
     async fn repair_ticket(&self, ticket: &mut Ticket) -> Result<Ticket> {
@@ -108,30 +98,44 @@ impl SurgeonAgent {
             .await
             .with_context(|| format!("failed to build surgeon prompt for ticket {}", ticket.id))?;
 
-        let structured_call = self
-            .llm_client
-            .chat_with_schema(
-                TaskKind::Surgeon,
-                &system_prompt,
-                &user_prompt,
-                self.fixed_files_tool(),
-            )
-            .await
-            .with_context(|| format!("surgeon model failed for ticket {}", ticket.id))?;
-        info!(
-            ticket_id = ticket.id.as_str(),
-            model = self.model(),
-            prompt_tokens = structured_call.usage.prompt_tokens,
-            completion_tokens = structured_call.usage.completion_tokens,
-            total_tokens = structured_call.usage.total_tokens,
-            "Surgeon token usage"
+        let modern_files_list = ticket.modern_file_paths.join(", ");
+        let full_prompt = format!(
+            "{system_prompt}\n\n{user_prompt}\n\nThe shadow tests failed. Use the TerminalTool to run tests if necessary. Use the FileEditorTool to directly edit the failing modern files ({modern_files_list}) to fix the behavioral divergence."
         );
-        ticket.record_llm_usage(&structured_call.usage);
-        let payload: FixedFilesPayload = structured_call.deserialize_arguments()?;
 
-        self.persist_fixed_files(ticket, payload).await?;
+        let prompt_file_path = format!(".prompt_surgeon_{}.txt", ticket.id);
+        fs::write(&prompt_file_path, &full_prompt)
+            .await
+            .with_context(|| {
+                format!("failed to write temporary prompt file {}", prompt_file_path)
+            })?;
+
+        let mut child = Command::new("uv")
+            .arg("run")
+            .arg("python")
+            .arg("openhands_worker.py")
+            .arg("--prompt-file")
+            .arg(&prompt_file_path)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| "failed to spawn openhands_worker.py process")?;
+
+        let status = child
+            .wait()
+            .await
+            .with_context(|| "failed to wait on openhands_worker.py process")?;
+
+        let _ = fs::remove_file(&prompt_file_path).await;
 
         ticket.retries = ticket.retries.saturating_add(1);
+
+        if !status.success() {
+            ticket.status =
+                TicketStatus::Failed(format!("openhands_worker.py failed with status {}", status));
+            return Ok(ticket.clone());
+        }
+
         ticket.status = TicketStatus::InProgress;
 
         info!(
@@ -143,58 +147,6 @@ impl SurgeonAgent {
         );
 
         Ok(ticket.clone())
-    }
-
-    async fn persist_fixed_files(&self, ticket: &Ticket, payload: FixedFilesPayload) -> Result<()> {
-        ensure!(
-            !payload.files.is_empty(),
-            "surgeon returned no files for ticket {}",
-            ticket.id
-        );
-
-        let allowed_paths = ticket
-            .modern_file_paths
-            .iter()
-            .chain(ticket.test_file_paths.iter())
-            .map(|path| normalize_relative_path(path))
-            .collect::<Result<HashSet<_>>>()?;
-
-        for file in payload.files {
-            ensure!(
-                !file.content.trim().is_empty(),
-                "surgeon returned empty file content for ticket {} at path `{}`",
-                ticket.id,
-                file.path
-            );
-
-            let relative_path = normalize_relative_path(&file.path).with_context(|| {
-                format!(
-                    "surgeon returned an invalid file path for ticket {}",
-                    ticket.id
-                )
-            })?;
-            ensure!(
-                allowed_paths.contains(&relative_path),
-                "surgeon attempted to modify an unexpected file `{relative_path}` for ticket {}",
-                ticket.id
-            );
-
-            let target_output_path = self.modern_root.join(&relative_path);
-            self.file_write_skill
-                .execute(vec![
-                    target_output_path.to_string_lossy().into_owned(),
-                    file.content,
-                ])
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to overwrite modern file `{relative_path}` for ticket {}",
-                        ticket.id
-                    )
-                })?;
-        }
-
-        Ok(())
     }
 
     async fn read_files(&self, root: &Path, relative_paths: &[String]) -> Result<PromptContext> {
@@ -272,32 +224,6 @@ impl SurgeonAgent {
         prompt.push('\n');
         Ok(prompt)
     }
-
-    fn fixed_files_tool(&self) -> ToolSpec {
-        ToolSpec {
-            name: "submit_fixed_files".to_owned(),
-            description: "Return the corrected contents for the failing modern files".to_owned(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "files": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string" },
-                                "content": { "type": "string" }
-                            },
-                            "required": ["path", "content"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["files"],
-                "additionalProperties": false
-            }),
-        }
-    }
 }
 
 impl Agent for SurgeonAgent {
@@ -306,7 +232,7 @@ impl Agent for SurgeonAgent {
     }
 
     fn model(&self) -> &str {
-        self.llm_client.model_for(TaskKind::Surgeon)
+        "openhands"
     }
 
     async fn process_ticket(&self, ticket: &Ticket) -> Result<Ticket> {
@@ -338,10 +264,6 @@ fn extract_failure_reason(ticket: &Ticket) -> Result<&str> {
             "surgeon expected TicketStatus::Failed but received {other:?}"
         )),
     }
-}
-
-fn normalize_relative_path(path: &str) -> Result<String> {
-    normalize_portable_relative_path(path, "file path").map(|path| path.into_string())
 }
 
 #[cfg(test)]

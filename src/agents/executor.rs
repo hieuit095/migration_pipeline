@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
 use std::process::Stdio;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, anyhow};
 use tokio::fs;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use crate::config::{TaskKind, ZeroClawClient};
+use crate::config::ZeroClawClient;
 use crate::skills::Skill;
 use crate::utils::path::normalize_relative_path as normalize_portable_relative_path;
 
@@ -67,6 +67,7 @@ pub struct ExecutorAgent {
     file_io_skill: Arc<dyn Skill>,
     #[allow(dead_code)]
     file_write_skill: Arc<dyn Skill>,
+    #[allow(dead_code)]
     llm_client: Arc<ZeroClawClient>,
 }
 
@@ -92,7 +93,7 @@ impl ExecutorAgent {
     }
 
     pub fn provider(&self) -> &str {
-        self.llm_client.provider_for(TaskKind::Executor)
+        "openhands"
     }
 
     async fn execute_ticket(&self, ticket: &mut Ticket) -> Result<PersistedArtifacts> {
@@ -114,12 +115,16 @@ impl ExecutorAgent {
             .await
             .with_context(|| format!("failed to build executor prompt for ticket {}", ticket.id))?;
 
-        let full_prompt = format!("{system_prompt}\n\n{user_prompt}\n\nPlease translate the legacy context into the modern framework and save it to exactly `{suggested_source_path}` and `{suggested_test_path}`.");
+        let full_prompt = format!(
+            "{system_prompt}\n\n{user_prompt}\n\nPlease translate the legacy context into the modern framework and save it to exactly `{suggested_source_path}` and `{suggested_test_path}`."
+        );
 
         let prompt_file_path = format!(".prompt_executor_{}.txt", ticket.id);
         fs::write(&prompt_file_path, full_prompt)
             .await
-            .with_context(|| format!("failed to write temporary prompt file {}", prompt_file_path))?;
+            .with_context(|| {
+                format!("failed to write temporary prompt file {}", prompt_file_path)
+            })?;
 
         let mut child = Command::new("uv")
             .arg("run")
@@ -249,7 +254,6 @@ impl ExecutorAgent {
         prompt.push('\n');
         Ok(prompt)
     }
-
 }
 
 impl Agent for ExecutorAgent {
@@ -258,7 +262,7 @@ impl Agent for ExecutorAgent {
     }
 
     fn model(&self) -> &str {
-        self.llm_client.model_for(TaskKind::Executor)
+        "openhands"
     }
 
     async fn process_ticket(&self, ticket: &Ticket) -> Result<Ticket> {
