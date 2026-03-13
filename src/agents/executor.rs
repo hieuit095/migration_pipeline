@@ -8,7 +8,6 @@ use tokio::fs;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use crate::config::ZeroClawClient;
 use crate::skills::Skill;
 use crate::utils::path::normalize_relative_path as normalize_portable_relative_path;
 
@@ -62,29 +61,14 @@ struct PersistedArtifacts {
 
 pub struct ExecutorAgent {
     legacy_root: PathBuf,
-    #[allow(dead_code)]
-    output_root: PathBuf,
     file_io_skill: Arc<dyn Skill>,
-    #[allow(dead_code)]
-    file_write_skill: Arc<dyn Skill>,
-    #[allow(dead_code)]
-    llm_client: Arc<ZeroClawClient>,
 }
 
 impl ExecutorAgent {
-    pub fn new(
-        legacy_root: impl Into<PathBuf>,
-        output_root: impl Into<PathBuf>,
-        file_io_skill: Arc<dyn Skill>,
-        file_write_skill: Arc<dyn Skill>,
-        llm_client: Arc<ZeroClawClient>,
-    ) -> Self {
+    pub fn new(legacy_root: impl Into<PathBuf>, file_io_skill: Arc<dyn Skill>) -> Self {
         Self {
             legacy_root: legacy_root.into(),
-            output_root: output_root.into(),
             file_io_skill,
-            file_write_skill,
-            llm_client,
         }
     }
 

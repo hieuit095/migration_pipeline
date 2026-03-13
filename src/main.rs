@@ -82,10 +82,7 @@ async fn run_pipeline(legacy_root: PathBuf, modern_root: PathBuf) -> Result<()> 
         BlueprinterAgent::new(Arc::clone(&ast_parsing_skill), Arc::clone(&llm_client));
     let executor = Arc::new(ExecutorAgent::new(
         legacy_root.clone(),
-        modern_root.clone(),
         Arc::clone(&file_io_skill),
-        Arc::clone(&file_write_skill),
-        Arc::clone(&llm_client),
     ));
     let verifier = Arc::new(VerifierAgent::new(
         legacy_root.clone(),
@@ -99,8 +96,6 @@ async fn run_pipeline(legacy_root: PathBuf, modern_root: PathBuf) -> Result<()> 
         legacy_root.clone(),
         modern_root.clone(),
         Arc::clone(&file_io_skill),
-        Arc::clone(&file_write_skill),
-        Arc::clone(&llm_client),
     ));
 
     info!(

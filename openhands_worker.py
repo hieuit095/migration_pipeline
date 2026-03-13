@@ -63,30 +63,25 @@ def main():
     llm = LLM(**llm_kwargs)
 
     # Equip the agent with FileEditorTool and TerminalTool
-    tools = [Tool("FileEditorTool"), Tool("TerminalTool")]
-
-    # Create the Agent
-    agent = Agent(llm=llm, tools=tools)
+    # OpenHands tools are typically automatically provided, but to strictly adhere:
+    try:
+        from openhands.events.tool import Tool
+        tools = [Tool(name="FileEditorTool"), Tool(name="TerminalTool")]
+        agent = Agent(llm=llm, tools=tools)
+    except ImportError:
+        # Fallback to standard agent creation if tools can't be imported this way
+        agent = Agent(llm=llm)
 
     # Start a Conversation in the specified workspace
-    # Using kwargs handling depending on SDK versions if necessary, but standard seems straightforward
+    conversation = Conversation(
+        agent=agent,
+        workspace=args.workspace,
+    )
+
     try:
-        conversation = Conversation(
-            agent=agent,
-            workspace=args.workspace,
-            prompt=full_prompt
-        )
+        # Send the initial message and start the autonomous run loop
+        conversation.send_message(full_prompt)
         conversation.run()
-    except TypeError:
-        # Fallback if the SDK accepts prompt in the run method
-        conversation = Conversation(
-            agent=agent,
-            workspace=args.workspace,
-        )
-        try:
-            conversation.run(prompt=full_prompt)
-        except TypeError:
-            conversation.run(full_prompt)
     except Exception as e:
         print(f"Error during conversation execution: {e}", file=sys.stderr)
         sys.exit(1)
