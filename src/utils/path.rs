@@ -124,8 +124,8 @@ mod tests {
 
     #[test]
     fn normalize_relative_path_rejects_empty_paths() {
-        let error = normalize_relative_path("", "generated file path")
-            .expect_err("empty path should fail");
+        let error =
+            normalize_relative_path("", "generated file path").expect_err("empty path should fail");
 
         assert!(error.to_string().contains("cannot be empty"));
     }

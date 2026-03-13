@@ -42,9 +42,9 @@ mod tests {
     fn setup_telemetry_creates_logs_directory() {
         // Clean up any existing logs directory first
         let _ = fs::remove_dir_all("logs");
-        
+
         let result = setup_telemetry();
-        
+
         // Note: This may fail if tracing is already initialized in the test environment
         // which is expected behavior - we just verify the directory creation works
         if result.is_ok() {
