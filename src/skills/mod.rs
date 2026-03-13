@@ -2192,4 +2192,88 @@ pub fn bootstrap(port: u16) -> String {
 
         fs::remove_dir_all(root).expect("should clean up temp directory");
     }
+
+    #[test]
+    fn parse_dependency_graph_json_parses_valid_json() {
+        let json = r#"{"files": [
+            {"path": "src/main.js", "language": "javascript", "imports": [], "functions": [], "classes": [], "variables": [], "branches": []}
+        ]}"#;
+        let result = parse_dependency_graph_json(json);
+        assert!(result.is_ok());
+        let graph = result.unwrap();
+        assert_eq!(graph.files.len(), 1);
+        assert_eq!(graph.files[0].path, "src/main.js");
+    }
+
+    #[test]
+    fn parse_dependency_graph_json_returns_error_for_invalid_json() {
+        let json = "not valid json";
+        let result = parse_dependency_graph_json(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn diff_dependency_graphs_identifies_missing_functions() {
+        let legacy = DependencyGraph {
+            files: vec![FileDependencyNode {
+                path: "src/app.js".to_string(),
+                language: "javascript".to_string(),
+                functions: vec![FunctionSignature {
+                    name: "oldFunction".to_string(),
+                    parameters: vec![],
+                    is_async: false,
+                    is_generator: false,
+                    return_type: None,
+                    exported: true,
+                }],
+                ..Default::default()
+            }],
+        };
+        let modern = DependencyGraph {
+            files: vec![FileDependencyNode {
+                path: "src/app.ts".to_string(),
+                language: "typescript".to_string(),
+                functions: vec![],
+                ..Default::default()
+            }],
+        };
+
+        let diff = diff_dependency_graphs(&legacy, &modern);
+        assert!(!diff.missing_functions.is_empty());
+    }
+
+    #[test]
+    fn diff_dependency_graphs_identifies_missing_classes() {
+        let legacy = DependencyGraph {
+            files: vec![FileDependencyNode {
+                path: "src/app.js".to_string(),
+                language: "javascript".to_string(),
+                classes: vec![ClassDefinition {
+                    name: "LegacyClass".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let modern = DependencyGraph {
+            files: vec![FileDependencyNode {
+                path: "src/app.ts".to_string(),
+                language: "typescript".to_string(),
+                classes: vec![],
+                ..Default::default()
+            }],
+        };
+
+        let diff = diff_dependency_graphs(&legacy, &modern);
+        assert!(!diff.missing_classes.is_empty());
+    }
+
+    #[test]
+    fn ast_diff_is_empty_when_all_fields_match() {
+        let legacy = DependencyGraph::default();
+        let modern = DependencyGraph::default();
+
+        let diff = diff_dependency_graphs(&legacy, &modern);
+        assert!(diff.is_empty());
+    }
 }
