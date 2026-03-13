@@ -5,14 +5,12 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs as std_fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tracing::warn;
-use tree_sitter::{Node, Parser};
 
 use super::sandbox::{
     SANDBOX_TIMEOUT_SECS, SandboxExecutionEnvironment, SandboxRuntime, build_container_name,
@@ -86,8 +84,6 @@ enum ShadowRuntime {
     Node,
     NodeTypeScript,
     Python,
-    Go,
-    Rust,
 }
 
 #[derive(Debug)]
@@ -102,38 +98,6 @@ struct RenderedShadowRunner {
     runner_name: String,
     runner_contents: String,
     inner_command: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CallableReference {
-    Function(String),
-    Member { receiver: String, name: String },
-}
-
-#[derive(Debug, Clone)]
-struct ParameterBinding {
-    decode_type: String,
-    local_type: String,
-    local_name: String,
-    call_expr: String,
-}
-
-#[derive(Debug, Clone)]
-struct GoCallableSpec {
-    package_name: String,
-    import_path: Option<String>,
-    target_dir: Utf8PathBuf,
-    callable: CallableReference,
-    parameters: Vec<ParameterBinding>,
-    return_types: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct RustCallableSpec {
-    callable: CallableReference,
-    module_declaration: String,
-    parameters: Vec<ParameterBinding>,
-    return_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -686,8 +650,6 @@ impl ShadowRuntime {
             Some("js") | Some("mjs") | Some("cjs") => Ok(Self::Node),
             Some("ts") | Some("tsx") => Ok(Self::NodeTypeScript),
             Some("py") => Ok(Self::Python),
-            Some("go") => Ok(Self::Go),
-            Some("rs") => Ok(Self::Rust),
             Some(other) => bail!(
                 "ShadowTestSkill does not support the `.{other}` extension for shadow execution yet"
             ),
@@ -695,12 +657,13 @@ impl ShadowRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_command(
         self,
         label: &str,
-        source_root: &Path,
-        relative_path: &Utf8Path,
-        execution_environment: &SandboxExecutionEnvironment,
+        _source_root: &Path,
+        _relative_path: &Utf8Path,
+        _execution_environment: &SandboxExecutionEnvironment,
         module_path: &str,
         callable: &str,
         fixture_path: &str,
@@ -741,21 +704,6 @@ impl ShadowRuntime {
                     fixture_path.to_owned(),
                 ],
             },
-            Self::Go => render_go_shadow_runner(
-                &runner_label,
-                source_root,
-                relative_path,
-                callable,
-                fixture_path,
-                execution_environment.workdir(),
-            )?,
-            Self::Rust => render_rust_shadow_runner(
-                &runner_label,
-                source_root,
-                relative_path,
-                callable,
-                fixture_path,
-            )?,
         };
 
         Ok(runner)
@@ -766,8 +714,6 @@ impl ShadowRuntime {
             Self::Node => SandboxRuntime::Node,
             Self::NodeTypeScript => SandboxRuntime::NodeTypeScript,
             Self::Python => SandboxRuntime::Python,
-            Self::Go => SandboxRuntime::Go,
-            Self::Rust => SandboxRuntime::Rust,
         }
     }
 }
@@ -1141,28 +1087,42 @@ mod tests {
 
     #[test]
     fn build_command_uses_label_specific_runner_name() {
-        let (legacy_runner_name, _, legacy_command) = ShadowRuntime::Node.build_command(
-            "legacy",
-            "/app/src/server.js",
-            "bootstrap",
-            "/shadow/fixture.json",
-        );
-        let (modern_runner_name, _, modern_command) = ShadowRuntime::Node.build_command(
-            "modern",
-            "/app/src/server.js",
-            "bootstrap",
-            "/shadow/fixture.json",
+        let source_root = std::path::Path::new("/tmp/legacy");
+        let relative_path = camino::Utf8PathBuf::from("src/server.js");
+        let execution_environment = crate::skills::sandbox::SandboxExecutionEnvironment::mounted(
+            "node:alpine".to_owned(),
+            "/app".to_owned(),
+            "dummy_mount".to_owned(),
         );
 
-        assert_eq!(legacy_runner_name, "legacy_shadow_runner.mjs");
-        assert_eq!(modern_runner_name, "modern_shadow_runner.mjs");
+        let legacy_runner = ShadowRuntime::Node.build_command(
+            "legacy",
+            source_root,
+            &relative_path,
+            &execution_environment,
+            "/app/src/server.js",
+            "bootstrap",
+            "/shadow/fixture.json",
+        ).unwrap();
+        let modern_runner = ShadowRuntime::Node.build_command(
+            "modern",
+            source_root,
+            &relative_path,
+            &execution_environment,
+            "/app/src/server.js",
+            "bootstrap",
+            "/shadow/fixture.json",
+        ).unwrap();
+
+        assert_eq!(legacy_runner.runner_name, "legacy_shadow_runner.mjs");
+        assert_eq!(modern_runner.runner_name, "modern_shadow_runner.mjs");
         assert!(
-            legacy_command
+            legacy_runner.inner_command
                 .iter()
                 .any(|argument| argument == "/shadow/legacy_shadow_runner.mjs")
         );
         assert!(
-            modern_command
+            modern_runner.inner_command
                 .iter()
                 .any(|argument| argument == "/shadow/modern_shadow_runner.mjs")
         );

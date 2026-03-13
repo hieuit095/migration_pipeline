@@ -933,7 +933,7 @@ fn parse_kimi_tool_name(header: &str) -> Option<&str> {
         .or_else(|| normalized.strip_prefix("function."))
         .unwrap_or(normalized);
     let tool_name_end = normalized
-        .find(|ch: char| matches!(ch, ':' | ' ' | '\t' | '\r' | '\n'))
+        .find(|ch: char| [':', ' ', '\t', '\r', '\n'].contains(&ch))
         .unwrap_or(normalized.len());
     let tool_name = normalized[..tool_name_end].trim();
     (!tool_name.is_empty()).then_some(tool_name)
@@ -1052,7 +1052,7 @@ fn extract_tool_call_tag_bodies(text: &str) -> Vec<&str> {
         }
 
         let Some(relative_tag_name_end) =
-            text[tag_name_start..].find(|ch: char| matches!(ch, '>' | ' ' | '\t' | '\r' | '\n'))
+            text[tag_name_start..].find(|ch: char| ['>', ' ', '\t', '\r', '\n'].contains(&ch))
         else {
             break;
         };
@@ -1532,7 +1532,8 @@ mod tests {
     };
     use anyhow::{Result, anyhow};
     use std::collections::VecDeque;
-    use std::sync::{Arc, LazyLock, Mutex};
+    use std::sync::{Arc, LazyLock};
+    use tokio::sync::Mutex;
     use std::time::Duration;
     use zeroclaw::providers::traits::TokenUsage;
     use zeroclaw::providers::{ChatRequest, ChatResponse, ToolCall};
@@ -1540,10 +1541,8 @@ mod tests {
 
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    async fn lock_env() -> tokio::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX.lock().await
     }
 
     struct EnvVarGuard {
@@ -1586,13 +1585,13 @@ mod tests {
 
     #[derive(Default)]
     struct ScriptedBackend {
-        responses: Mutex<VecDeque<Result<ChatResponse>>>,
+        responses: std::sync::Mutex<VecDeque<Result<ChatResponse>>>,
     }
 
     impl ScriptedBackend {
         fn new(responses: Vec<Result<ChatResponse>>) -> Self {
             Self {
-                responses: Mutex::new(VecDeque::from(responses)),
+                responses: std::sync::Mutex::new(VecDeque::from(responses)),
             }
         }
     }
@@ -1735,9 +1734,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn model_router_uses_default_provider_and_model_when_env_is_missing() {
-        let _env_lock = lock_env();
+    #[tokio::test]
+    async fn model_router_uses_default_provider_and_model_when_env_is_missing() {
+        let _env_lock = lock_env().await;
         let _provider_env = EnvVarGuard::remove(TaskKind::Blueprinter.provider_env());
         let _model_env = EnvVarGuard::remove(TaskKind::Blueprinter.model_env());
         let route = ModelRouter::from_env(TaskKind::Blueprinter, "google/gemini-3-flash-preview")
@@ -1748,9 +1747,9 @@ mod tests {
         assert_eq!(route.hint, "hint:blueprinter");
     }
 
-    #[test]
-    fn model_router_uses_task_specific_provider_override() {
-        let _env_lock = lock_env();
+    #[tokio::test]
+    async fn model_router_uses_task_specific_provider_override() {
+        let _env_lock = lock_env().await;
         let _provider_env = EnvVarGuard::set(TaskKind::Blueprinter.provider_env(), "Together.ai");
         let _model_env = EnvVarGuard::set(
             TaskKind::Blueprinter.model_env(),
@@ -1764,9 +1763,9 @@ mod tests {
         assert_eq!(route.model, "meta-llama/Llama-4-Maverick");
     }
 
-    #[test]
-    fn docker_sandbox_config_uses_defaults_when_env_is_missing() {
-        let _env_lock = lock_env();
+    #[tokio::test]
+    async fn docker_sandbox_config_uses_defaults_when_env_is_missing() {
+        let _env_lock = lock_env().await;
         let _memory_env = EnvVarGuard::remove(super::DOCKER_SANDBOX_MEMORY_ENV);
         let _cpu_env = EnvVarGuard::remove(super::DOCKER_SANDBOX_CPUS_ENV);
 
@@ -1776,9 +1775,9 @@ mod tests {
         assert_eq!(config.cpu_limit, "0.5");
     }
 
-    #[test]
-    fn zeroclaw_client_requires_openrouter_api_key() {
-        let _env_lock = lock_env();
+    #[tokio::test]
+    async fn zeroclaw_client_requires_openrouter_api_key() {
+        let _env_lock = lock_env().await;
         let _openrouter_key = EnvVarGuard::remove(super::OPENROUTER_API_KEY_ENV);
 
         let error = ZeroClawClient::new(build_task_configs())
@@ -1788,9 +1787,9 @@ mod tests {
         assert!(error.to_string().contains(super::OPENROUTER_API_KEY_ENV));
     }
 
-    #[test]
-    fn zeroclaw_client_requires_openai_api_key_for_openai_routes() {
-        let _env_lock = lock_env();
+    #[tokio::test]
+    async fn zeroclaw_client_requires_openai_api_key_for_openai_routes() {
+        let _env_lock = lock_env().await;
         let _openai_key = EnvVarGuard::remove(super::OPENAI_API_KEY_ENV);
 
         let error = ZeroClawClient::new(vec![TaskModelConfig::new(
@@ -1804,9 +1803,9 @@ mod tests {
         assert!(error.to_string().contains(super::OPENAI_API_KEY_ENV));
     }
 
-    #[test]
-    fn task_model_config_injects_provider_specific_api_keys() {
-        let _env_lock = lock_env();
+    #[tokio::test]
+    async fn task_model_config_injects_provider_specific_api_keys() {
+        let _env_lock = lock_env().await;
         let _openai_key = EnvVarGuard::set(super::OPENAI_API_KEY_ENV, "openai-key");
         let _together_key = EnvVarGuard::set(super::TOGETHER_API_KEY_ENV, "together-key");
         let _openrouter_key = EnvVarGuard::set(super::OPENROUTER_API_KEY_ENV, "openrouter-key");
@@ -1839,7 +1838,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_schema_falls_back_after_executor_plain_text_response() {
-        let _env_lock = lock_env();
+        let _env_lock = lock_env().await;
         let _openai_api_key = EnvVarGuard::set(super::OPENAI_API_KEY_ENV, "test-openai-key");
         let backend = Arc::new(ScriptedBackend::new(vec![
             Ok(ChatResponse {
@@ -2282,7 +2281,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_schema_rejects_wrong_tool_name() {
-        let _env_lock = lock_env();
+        let _env_lock = lock_env().await;
         let _openai_api_key = EnvVarGuard::remove(super::OPENAI_API_KEY_ENV);
         let backend = Arc::new(ScriptedBackend::new(vec![Ok(ChatResponse {
             text: None,

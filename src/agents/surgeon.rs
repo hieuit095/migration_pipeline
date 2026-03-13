@@ -227,6 +227,7 @@ impl SurgeonAgent {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn user_prompt(
         &self,
         ticket: &Ticket,
