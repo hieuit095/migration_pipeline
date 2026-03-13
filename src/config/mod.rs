@@ -1533,8 +1533,8 @@ mod tests {
     use anyhow::{Result, anyhow};
     use std::collections::VecDeque;
     use std::sync::{Arc, LazyLock};
-    use tokio::sync::Mutex;
     use std::time::Duration;
+    use tokio::sync::Mutex;
     use zeroclaw::providers::traits::TokenUsage;
     use zeroclaw::providers::{ChatRequest, ChatResponse, ToolCall};
     use zeroclaw::tools::ToolSpec;

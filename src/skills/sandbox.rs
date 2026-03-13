@@ -871,7 +871,9 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_invocation_enforces_network_and_read_only_mounts() {
-        if std::env::var("CI").is_ok() { return; }
+        if std::env::var("CI").is_ok() {
+            return;
+        }
         let root = make_temp_modern_root();
         fs::write(root.join("tests/test_app.py"), "print('ok')").expect("fixture should exist");
 
@@ -900,7 +902,9 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_invocation_selects_python_container_command() {
-        if std::env::var("CI").is_ok() { return; }
+        if std::env::var("CI").is_ok() {
+            return;
+        }
         let root = make_temp_modern_root();
         fs::write(root.join("tests/test_app.py"), "print('ok')").expect("fixture should exist");
 
@@ -922,7 +926,9 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_invocation_rejects_parent_directory_traversal() {
-        if std::env::var("CI").is_ok() { return; }
+        if std::env::var("CI").is_ok() {
+            return;
+        }
         let root = make_temp_modern_root();
         fs::write(root.join("tests/test_app.py"), "print('ok')").expect("fixture should exist");
 
@@ -938,7 +944,9 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_invocation_rejects_mixed_language_test_suites() {
-        if std::env::var("CI").is_ok() { return; }
+        if std::env::var("CI").is_ok() {
+            return;
+        }
         let root = make_temp_modern_root();
         fs::create_dir_all(root.join("src")).expect("src directory should exist");
         fs::write(root.join("tests/test_app.py"), "print('ok')")

@@ -1095,34 +1095,40 @@ mod tests {
             "dummy_mount".to_owned(),
         );
 
-        let legacy_runner = ShadowRuntime::Node.build_command(
-            "legacy",
-            source_root,
-            &relative_path,
-            &execution_environment,
-            "/app/src/server.js",
-            "bootstrap",
-            "/shadow/fixture.json",
-        ).unwrap();
-        let modern_runner = ShadowRuntime::Node.build_command(
-            "modern",
-            source_root,
-            &relative_path,
-            &execution_environment,
-            "/app/src/server.js",
-            "bootstrap",
-            "/shadow/fixture.json",
-        ).unwrap();
+        let legacy_runner = ShadowRuntime::Node
+            .build_command(
+                "legacy",
+                source_root,
+                &relative_path,
+                &execution_environment,
+                "/app/src/server.js",
+                "bootstrap",
+                "/shadow/fixture.json",
+            )
+            .unwrap();
+        let modern_runner = ShadowRuntime::Node
+            .build_command(
+                "modern",
+                source_root,
+                &relative_path,
+                &execution_environment,
+                "/app/src/server.js",
+                "bootstrap",
+                "/shadow/fixture.json",
+            )
+            .unwrap();
 
         assert_eq!(legacy_runner.runner_name, "legacy_shadow_runner.mjs");
         assert_eq!(modern_runner.runner_name, "modern_shadow_runner.mjs");
         assert!(
-            legacy_runner.inner_command
+            legacy_runner
+                .inner_command
                 .iter()
                 .any(|argument| argument == "/shadow/legacy_shadow_runner.mjs")
         );
         assert!(
-            modern_runner.inner_command
+            modern_runner
+                .inner_command
                 .iter()
                 .any(|argument| argument == "/shadow/modern_shadow_runner.mjs")
         );
