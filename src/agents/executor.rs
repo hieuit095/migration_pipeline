@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
+use std::process::Stdio;
 
-use anyhow::{Context, Result, anyhow, ensure};
-use serde::Deserialize;
+use anyhow::{Context, Result, anyhow};
+use tokio::fs;
+use tokio::process::Command;
 use tracing::{info, warn};
-use zeroclaw::tools::ToolSpec;
 
 use crate::config::{TaskKind, ZeroClawClient};
 use crate::skills::Skill;
@@ -53,18 +54,6 @@ static FRAMEWORK_EXTENSIONS: LazyLock<HashMap<&'static str, &'static str>> = Laz
     ])
 });
 
-#[derive(Debug, Deserialize)]
-struct GeneratedArtifactsPayload {
-    source_files: Vec<GeneratedFile>,
-    test_files: Vec<GeneratedFile>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GeneratedFile {
-    path: String,
-    content: String,
-}
-
 #[derive(Debug)]
 struct PersistedArtifacts {
     source_files: Vec<String>,
@@ -73,8 +62,10 @@ struct PersistedArtifacts {
 
 pub struct ExecutorAgent {
     legacy_root: PathBuf,
+    #[allow(dead_code)]
     output_root: PathBuf,
     file_io_skill: Arc<dyn Skill>,
+    #[allow(dead_code)]
     file_write_skill: Arc<dyn Skill>,
     llm_client: Arc<ZeroClawClient>,
 }
@@ -122,34 +113,40 @@ impl ExecutorAgent {
             )
             .await
             .with_context(|| format!("failed to build executor prompt for ticket {}", ticket.id))?;
-        let structured_call = self
-            .llm_client
-            .chat_with_schema(
-                TaskKind::Executor,
-                &system_prompt,
-                &user_prompt,
-                self.generated_artifacts_tool(),
-            )
-            .await
-            .with_context(|| format!("executor model failed for ticket {}", ticket.id))?;
-        info!(
-            ticket_id = ticket.id.as_str(),
-            model = self.model(),
-            prompt_tokens = structured_call.usage.prompt_tokens,
-            completion_tokens = structured_call.usage.completion_tokens,
-            total_tokens = structured_call.usage.total_tokens,
-            "Executor token usage"
-        );
-        ticket.record_llm_usage(&structured_call.usage);
-        let payload: GeneratedArtifactsPayload = structured_call.deserialize_arguments()?;
 
-        self.persist_generated_artifacts(
-            ticket,
-            payload,
-            &suggested_source_path,
-            &suggested_test_path,
-        )
-        .await
+        let full_prompt = format!("{system_prompt}\n\n{user_prompt}\n\nPlease translate the legacy context into the modern framework and save it to exactly `{suggested_source_path}` and `{suggested_test_path}`.");
+
+        let prompt_file_path = format!(".prompt_executor_{}.txt", ticket.id);
+        fs::write(&prompt_file_path, full_prompt)
+            .await
+            .with_context(|| format!("failed to write temporary prompt file {}", prompt_file_path))?;
+
+        let mut child = Command::new("uv")
+            .arg("run")
+            .arg("python")
+            .arg("openhands_worker.py")
+            .arg("--prompt-file")
+            .arg(&prompt_file_path)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| "failed to spawn openhands_worker.py process")?;
+
+        let status = child
+            .wait()
+            .await
+            .with_context(|| "failed to wait on openhands_worker.py process")?;
+
+        let _ = fs::remove_file(&prompt_file_path).await;
+
+        if !status.success() {
+            anyhow::bail!("openhands_worker.py failed with status {}", status);
+        }
+
+        Ok(PersistedArtifacts {
+            source_files: vec![suggested_source_path],
+            test_files: vec![suggested_test_path],
+        })
     }
 
     async fn load_legacy_context(&self, ticket: &Ticket) -> Result<PromptContext> {
@@ -171,98 +168,6 @@ impl ExecutorAgent {
         args.extend(ticket.context_files.iter().cloned());
         let context_path = self.file_io_skill.execute(args).await?;
         Ok(PromptContext::from_temp_path(context_path))
-    }
-
-    async fn persist_generated_artifacts(
-        &self,
-        ticket: &Ticket,
-        payload: GeneratedArtifactsPayload,
-        suggested_source_path: &str,
-        suggested_test_path: &str,
-    ) -> Result<PersistedArtifacts> {
-        ensure!(
-            !payload.source_files.is_empty(),
-            "executor returned no source files for ticket {}",
-            ticket.id
-        );
-        ensure!(
-            !payload.test_files.is_empty(),
-            "executor returned no test files for ticket {}",
-            ticket.id
-        );
-
-        let source_files = self
-            .persist_files(
-                "source",
-                ticket,
-                payload.source_files,
-                suggested_source_path,
-            )
-            .await?;
-        let test_files = self
-            .persist_files("test", ticket, payload.test_files, suggested_test_path)
-            .await?;
-
-        Ok(PersistedArtifacts {
-            source_files,
-            test_files,
-        })
-    }
-
-    async fn persist_files(
-        &self,
-        file_role: &str,
-        ticket: &Ticket,
-        files: Vec<GeneratedFile>,
-        suggested_primary_path: &str,
-    ) -> Result<Vec<String>> {
-        let mut persisted_paths = Vec::with_capacity(files.len());
-        let mut includes_suggested_path = false;
-
-        for file in files {
-            ensure!(
-                !file.content.trim().is_empty(),
-                "executor returned empty {file_role} content for ticket {} at path `{}`",
-                ticket.id,
-                file.path
-            );
-
-            let relative_path = normalize_relative_path(&file.path).with_context(|| {
-                format!(
-                    "executor returned an invalid {file_role} file path for ticket {}",
-                    ticket.id
-                )
-            })?;
-            if relative_path == suggested_primary_path {
-                includes_suggested_path = true;
-            }
-
-            let absolute_path = self.output_root.join(&relative_path);
-            self.file_write_skill
-                .execute(vec![absolute_path.to_string_lossy().into_owned(), file.content])
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to persist generated {file_role} output `{relative_path}` for ticket {}",
-                        ticket.id
-                    )
-                })?;
-
-            if !persisted_paths.contains(&relative_path) {
-                persisted_paths.push(relative_path);
-            }
-        }
-
-        if !includes_suggested_path {
-            warn!(
-                ticket_id = ticket.id.as_str(),
-                file_role,
-                suggested_primary_path,
-                "Executor generated files did not include the suggested primary path"
-            );
-        }
-
-        Ok(persisted_paths)
     }
 
     fn system_prompt(&self, ticket: &Ticket) -> String {
@@ -345,21 +250,6 @@ impl ExecutorAgent {
         Ok(prompt)
     }
 
-    fn generated_artifacts_tool(&self) -> ToolSpec {
-        ToolSpec {
-            name: "submit_generated_artifacts".to_owned(),
-            description: "Return the generated modern source files and runnable tests".to_owned(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "source_files": file_array_schema(),
-                    "test_files": file_array_schema()
-                },
-                "required": ["source_files", "test_files"],
-                "additionalProperties": false
-            }),
-        }
-    }
 }
 
 impl Agent for ExecutorAgent {
@@ -581,21 +471,6 @@ fn sanitize_for_filename(value: &str) -> String {
         .collect();
 
     sanitized.trim_matches('-').to_owned()
-}
-
-fn file_array_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "content": { "type": "string" }
-            },
-            "required": ["path", "content"],
-            "additionalProperties": false
-        }
-    })
 }
 
 #[cfg(test)]
