@@ -1,0 +1,2142 @@
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.openhands.dev/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Software Agent SDK
+
+> Build AI agents that write software. A clean, modular SDK with production-ready tools.
+
+The OpenHands Software Agent SDK is a set of Python and REST APIs for building **agents that work with code**.
+
+You can use the OpenHands Software Agent SDK for:
+
+* One-off tasks, like building a README for your repo
+* Routine maintenance tasks, like updating dependencies
+* Major tasks that involve multiple agents, like refactors and rewrites
+
+You can even use the SDK to build new developer experiences—it’s the engine behind the [OpenHands CLI](/openhands/usage/cli/quick-start) and [OpenHands Cloud](/openhands/usage/cloud/openhands-cloud).
+
+Get started with some examples or keep reading to learn more.
+
+## Features
+
+<Columns cols={3}>
+  <Card title="Single Python API" icon="python">
+    A unified Python API that enables you to run agents locally or in the cloud, define custom agent behaviors, and create custom tools.
+  </Card>
+
+  <Card title="Pre-defined Tools" icon="toolbox">
+    Ready-to-use tools for executing Bash commands, editing files, browsing the web, integrating with MCP, and more.
+  </Card>
+
+  <Card title="REST-based Agent Server" icon="server">
+    A production-ready server that runs agents anywhere, including Docker and Kubernetes, while connecting seamlessly to the Python API.
+  </Card>
+</Columns>
+
+## Why OpenHands Software Agent SDK?
+
+### Emphasis on coding
+
+While other agent SDKs (e.g. [LangChain](https://python.langchain.com/docs/tutorials/agents/)) are focused on more general use cases, like delivering chat-based support or automating back-office tasks, OpenHands is purpose-built for software engineering.
+
+While some folks do use OpenHands to solve more general tasks (code is a powerful tool!), most of us use OpenHands to work with code.
+
+### State-of-the-Art Performance
+
+OpenHands is a top performer across a wide variety of benchmarks, including SWE-bench, SWT-bench, and multi-SWE-bench. The SDK includes a number of state-of-the-art agentic features developed by our research team, including:
+
+* Task planning and decomposition
+* Automatic context compression
+* Security analysis
+* Strong agent-computer interfaces
+
+OpenHands has attracted researchers from a wide variety of academic institutions, and is [becoming the preferred harness](https://x.com/Alibaba_Qwen/status/1947766835023335516) for evaluating LLMs on coding tasks.
+
+### Free and Open Source
+
+OpenHands is also the leading open source framework for coding agents. It’s MIT-licensed, and can work with any LLM—including big proprietary LLMs like Claude and OpenAI, as well as open source LLMs like Qwen and Devstral.
+
+Other SDKs (e.g. [Claude Code](https://github.com/anthropics/claude-agent-sdk-python)) are proprietary and lock you into a particular model. Given how quickly models are evolving, it’s best to stay model-agnostic!
+
+## Get Started
+
+<Columns cols={1}>
+  <Card title="Getting Started Guide" href="/sdk/getting-started">
+    Install the SDK, run your first agent, and explore the guides.
+  </Card>
+</Columns>
+
+## Learn the SDK
+
+<Columns cols={2}>
+  <Card title="Core Concepts" href="/sdk/arch/overview">
+    Understand the SDK's architecture: agents, tools, workspaces, and more.
+  </Card>
+
+  <Card title="API Reference" href="https://github.com/OpenHands/software-agent-sdk/tree/main/openhands-sdk/openhands/sdk">
+    Explore the complete SDK API and source code.
+  </Card>
+</Columns>
+
+## Build with Examples
+
+<Columns cols={3}>
+  <Card title="Standalone SDK" href="/sdk/guides/hello-world">
+    Build local agents with custom tools and capabilities.
+  </Card>
+
+  <Card title="Remote Execution" href="/sdk/guides/agent-server/local-server">
+    Run agents on remote servers with Docker sandboxing.
+  </Card>
+
+  <Card title="GitHub Workflows" href="/sdk/guides/github-workflows/todo-management">
+    Automate repository tasks with agent-powered workflows.
+  </Card>
+</Columns>
+
+## Community
+
+<Columns cols={2}>
+  <Card title="Join Slack" href="https://openhands.dev/joinslack">
+    Connect with the OpenHands community on Slack.
+  </Card>
+
+  <Card title="GitHub Repository" href="https://github.com/OpenHands/software-agent-sdk">
+    Contribute to the SDK or report issues on GitHub.
+  </Card>
+</Columns>
+
+
+Built with [Mintlify](https://mintlify.com).
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.openhands.dev/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Getting Started
+
+> Install the OpenHands SDK and build AI agents that write software.
+
+The OpenHands SDK is a modular framework for building AI agents that interact with code, files, and system commands. Agents can execute bash commands, edit files, browse the web, and more.
+
+## Prerequisites
+
+Install the **[uv package manager](https://docs.astral.sh/uv/)** (version 0.8.13+):
+
+```bash  theme={null}
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+## Installation
+
+### Step 1: Acquire an LLM API Key
+
+The SDK requires an LLM API key from any [LiteLLM-supported provider](https://docs.litellm.ai/docs/providers). See our [recommended models](/openhands/usage/llms/llms) for best results.
+
+<AccordionGroup>
+  <Accordion title="Option 1: Direct Provider" icon="key">
+    Bring your own API key from providers like:
+
+    * [Anthropic](https://console.anthropic.com/)
+    * [OpenAI](https://platform.openai.com/)
+    * [Other LiteLLM-supported providers](https://docs.litellm.ai/docs/providers)
+
+    Example:
+
+    ```bash  theme={null}
+    export LLM_API_KEY="your-api-key"
+    uv run python examples/01_standalone_sdk/01_hello_world.py
+    ```
+  </Accordion>
+
+  <Accordion title="Option 2: OpenHands Cloud (Recommended)" icon="cloud">
+    Sign up for [OpenHands Cloud](https://app.all-hands.dev) and get an LLM API key from the [API keys page](https://app.all-hands.dev/settings/api-keys). This gives you access to models verified to work well with OpenHands, with no markup.
+
+    Example:
+
+    ```bash  theme={null}
+    export LLM_MODEL="openhands/claude-sonnet-4-5-20250929"
+    uv run python examples/01_standalone_sdk/01_hello_world.py
+    ```
+
+    [Learn more →](/openhands/usage/llms/openhands-llms)
+  </Accordion>
+
+  <Accordion title="Option 3: ChatGPT Subscription" icon="message">
+    If you have a ChatGPT Plus or Pro subscription, you can use `LLM.subscription_login()` to authenticate with your ChatGPT account and access Codex models without consuming API credits.
+
+    ```python  theme={null}
+    from openhands.sdk import LLM
+
+    llm = LLM.subscription_login(vendor="openai", model="gpt-5.2-codex")
+    ```
+
+    [Learn more →](/sdk/guides/llm-subscriptions)
+  </Accordion>
+</AccordionGroup>
+
+> Tip: Model name prefixes depend on your provider
+>
+> * If you bring your own provider key (Anthropic/OpenAI/etc.), use that provider's model name, e.g. `anthropic/claude-sonnet-4-5-20250929`
+>   OpenHands supports [dozens of models](https://docs.openhands.dev/sdk/arch/llm#llm-providers), you can choose the model you want to try.
+> * If you use OpenHands Cloud, use `openhands/`-prefixed models, e.g. `openhands/claude-sonnet-4-5-20250929`
+>
+> Many examples in the docs read the model from the `LLM_MODEL` environment variable. You can set it like:
+>
+> ```bash  theme={null}
+> export LLM_MODEL="openhands/claude-sonnet-4-5-20250929"  # for OpenHands Provider
+> ```
+
+**Set Your API Key:**
+
+```bash  theme={null}
+export LLM_API_KEY=your-api-key-here
+```
+
+### Step 2: Install the SDK
+
+<AccordionGroup>
+  <Accordion title="Option 1: Install via PyPI" icon="box">
+    ```bash  theme={null}
+    pip install openhands-sdk # Core SDK (openhands.sdk)
+    pip install openhands-tools  # Built-in tools (openhands.tools)
+    # Optional: required for sandboxed workspaces in Docker or remote servers
+    pip install openhands-workspace # Workspace backends (openhands.workspace)
+    pip install openhands-agent-server # Remote agent server (openhands.agent_server)
+    ```
+  </Accordion>
+
+  <Accordion title="Option 2: Install from Source" icon="code">
+    ```bash  theme={null}
+    # Clone the repository
+    git clone https://github.com/OpenHands/software-agent-sdk.git
+    cd software-agent-sdk
+
+    # Install dependencies and setup development environment
+    make build
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Step 3: Run Your First Agent
+
+Here's a complete example that creates an agent and asks it to perform a simple task:
+
+```python icon="python" expandable examples/01_standalone_sdk/01_hello_world.py theme={null}
+import os
+
+from openhands.sdk import LLM, Agent, Conversation, Tool
+from openhands.tools.file_editor import FileEditorTool
+from openhands.tools.task_tracker import TaskTrackerTool
+from openhands.tools.terminal import TerminalTool
+
+
+llm = LLM(
+    model=os.getenv("LLM_MODEL", "anthropic/claude-sonnet-4-5-20250929"),
+    api_key=os.getenv("LLM_API_KEY"),
+    base_url=os.getenv("LLM_BASE_URL", None),
+)
+
+agent = Agent(
+    llm=llm,
+    tools=[
+        Tool(name=TerminalTool.name),
+        Tool(name=FileEditorTool.name),
+        Tool(name=TaskTrackerTool.name),
+    ],
+)
+
+cwd = os.getcwd()
+conversation = Conversation(agent=agent, workspace=cwd)
+
+conversation.send_message("Write 3 facts about the current project into FACTS.txt.")
+conversation.run()
+print("All done!")
+```
+
+Run the example:
+
+```bash  theme={null}
+# Using a direct provider key (Anthropic/OpenAI/etc.)
+uv run python examples/01_standalone_sdk/01_hello_world.py
+```
+
+```bash  theme={null}
+# Using OpenHands Cloud
+export LLM_MODEL="openhands/claude-sonnet-4-5-20250929"
+uv run python examples/01_standalone_sdk/01_hello_world.py
+```
+
+You should see the agent understand your request, explore the project, and create a file with facts about it.
+
+## Core Concepts
+
+**Agent**: An AI-powered entity that can reason, plan, and execute actions using tools.
+
+**Tools**: Capabilities like executing bash commands, editing files, or browsing the web.
+
+**Workspace**: The execution environment where agents operate (local, Docker, or remote).
+
+**Conversation**: Manages the interaction lifecycle between you and the agent.
+
+## Basic Workflow
+
+1. **Configure LLM**: Choose model and provide API key
+2. **Create Agent**: Use preset or custom configuration
+3. **Add Tools**: Enable capabilities (bash, file editing, etc.)
+4. **Start Conversation**: Create conversation context
+5. **Send Message**: Provide task description
+6. **Run Agent**: Agent executes until task completes or stops
+7. **Get Result**: Review agent's output and actions
+
+## Try More Examples
+
+The repository includes 24+ examples demonstrating various capabilities:
+
+```bash  theme={null}
+# Simple hello world
+uv run python examples/01_standalone_sdk/01_hello_world.py
+
+# Custom tools
+uv run python examples/01_standalone_sdk/02_custom_tools.py
+
+# With skills
+uv run python examples/01_standalone_sdk/03_activate_microagent.py
+
+# See all examples
+ls examples/01_standalone_sdk/
+```
+
+## Next Steps
+
+### Explore Documentation
+
+* **[SDK Architecture](/sdk/arch/sdk)** - Deep dive into components
+* **[Tool System](/sdk/arch/tool-system)** - Available tools
+* **[Workspace Architecture](/sdk/arch/workspace)** - Execution environments
+* **[LLM Configuration](/sdk/arch/llm)** - Deep dive into language model configuration
+
+### Build Custom Solutions
+
+* **[Custom Tools](/sdk/guides/custom-tools)** - Create custom tools to expand agent capabilities
+* **[MCP Integration](/sdk/guides/mcp)** - Connect to external tools via Model Context Protocol
+* **[Docker Workspaces](/sdk/guides/agent-server/docker-sandbox)** - Sandbox agent execution in containers
+
+### Get Help
+
+* **[Slack Community](https://openhands.dev/joinslack)** - Ask questions and share projects
+* **[GitHub Issues](https://github.com/OpenHands/software-agent-sdk/issues)** - Report bugs or request features
+* **[Example Directory](https://github.com/OpenHands/software-agent-sdk/tree/main/examples)** - Browse working code samples
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.openhands.dev/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Hello World
+
+> The simplest possible OpenHands agent - configure an LLM, create an agent, and complete a task.
+
+export const path_to_script_0 = "examples/01_standalone_sdk/01_hello_world.py"
+
+> A ready-to-run example is available [here](#ready-to-run-example)!
+
+## Your First Agent
+
+This is the most basic example showing how to set up and run an OpenHands agent.
+
+<Steps>
+  <Step>
+    ### LLM Configuration
+
+    Configure the language model that will power your agent:
+
+    ```python icon="python" theme={null}
+    llm = LLM(
+        model=model,
+        api_key=SecretStr(api_key),
+        base_url=base_url,  # Optional
+        service_id="agent"
+    )
+    ```
+  </Step>
+
+  <Step>
+    ### Select an Agent
+
+    Use the preset agent with common built-in tools:
+
+    ```python icon="python" theme={null}
+    agent = get_default_agent(llm=llm, cli_mode=True)
+    ```
+
+    The default agent includes `BashTool`, `FileEditorTool`, etc.
+
+    <Tip>
+      For the complete list of available tools see the
+      [tools package source code](https://github.com/OpenHands/software-agent-sdk/tree/main/openhands-tools/openhands/tools).
+    </Tip>
+  </Step>
+
+  <Step>
+    ### Start a Conversation
+
+    Start a conversation to manage the agent's lifecycle:
+
+    ```python icon="python" theme={null}
+    conversation = Conversation(agent=agent, workspace=cwd)
+    conversation.send_message(
+      "Write 3 facts about the current project into FACTS.txt."
+    )
+    conversation.run()
+    ```
+  </Step>
+
+  <Step>
+    ### Expected Behavior
+
+    When you run this example:
+
+    1. The agent analyzes the current directory
+    2. Gathers information about the project
+    3. Creates `FACTS.txt` with 3 relevant facts
+    4. Completes and exits
+
+    Example output file:
+
+    ```text icon="text" wrap theme={null}
+    FACTS.txt
+    ---------
+    1. This is a Python project using the OpenHands Software Agent SDK.
+    2. The project includes examples demonstrating various agent capabilities.
+    3. The SDK provides tools for file manipulation, bash execution, and more.
+    ```
+  </Step>
+</Steps>
+
+## Ready-to-run Example
+
+<Note>
+  This example is available on GitHub: [examples/01\_standalone\_sdk/01\_hello\_world.py](https://github.com/OpenHands/software-agent-sdk/blob/main/examples/01_standalone_sdk/01_hello_world.py)
+</Note>
+
+```python icon="python" wrap expandable examples/01_standalone_sdk/01_hello_world.py theme={null}
+import os
+
+from openhands.sdk import LLM, Agent, Conversation, Tool
+from openhands.tools.file_editor import FileEditorTool
+from openhands.tools.task_tracker import TaskTrackerTool
+from openhands.tools.terminal import TerminalTool
+
+
+llm = LLM(
+    model=os.getenv("LLM_MODEL", "anthropic/claude-sonnet-4-5-20250929"),
+    api_key=os.getenv("LLM_API_KEY"),
+    base_url=os.getenv("LLM_BASE_URL", None),
+)
+
+agent = Agent(
+    llm=llm,
+    tools=[
+        Tool(name=TerminalTool.name),
+        Tool(name=FileEditorTool.name),
+        Tool(name=TaskTrackerTool.name),
+    ],
+)
+
+cwd = os.getcwd()
+conversation = Conversation(agent=agent, workspace=cwd)
+
+conversation.send_message("Write 3 facts about the current project into FACTS.txt.")
+conversation.run()
+print("All done!")
+```
+
+You can run the example code as-is.
+
+<Note>
+  The model name should follow the [LiteLLM convention](https://models.litellm.ai/): `provider/model_name` (e.g., `anthropic/claude-sonnet-4-5-20250929`, `openai/gpt-4o`).
+  The `LLM_API_KEY` should be the API key for your chosen provider.
+</Note>
+
+<CodeGroup>
+  <CodeBlock language="bash" filename="Bring-your-own provider key" icon="terminal" wrap>
+    {`export LLM_API_KEY="your-api-key"\nexport LLM_MODEL="anthropic/claude-sonnet-4-5-20250929"  # or openai/gpt-4o, etc.\ncd software-agent-sdk\nuv run python ${path_to_script_0}`}
+  </CodeBlock>
+
+  <CodeBlock language="bash" filename="OpenHands Cloud" icon="terminal" wrap>
+    {`# https://app.all-hands.dev/settings/api-keys\nexport LLM_API_KEY="your-openhands-api-key"\nexport LLM_MODEL="openhands/claude-sonnet-4-5-20250929"\ncd software-agent-sdk\nuv run python ${path_to_script_0}`}
+  </CodeBlock>
+</CodeGroup>
+
+<Tip>
+  **ChatGPT Plus/Pro subscribers**: You can use `LLM.subscription_login()` to authenticate with your ChatGPT account and access Codex models without consuming API credits. See the [LLM Subscriptions guide](/sdk/guides/llm-subscriptions) for details.
+</Tip>
+
+## Next Steps
+
+* **[Custom Tools](/sdk/guides/custom-tools)** - Create custom tools for specialized needs
+* **[Model Context Protocol (MCP)](/sdk/guides/mcp)** - Integrate external MCP servers
+* **[Security Analyzer](/sdk/guides/security)** - Add security validation to tool usage
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.openhands.dev/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Custom Tools
+
+> Tools define what agents can do. The SDK includes built-in tools for common operations and supports creating custom tools for specialized needs.
+
+export const path_to_script_0 = "examples/01_standalone_sdk/02_custom_tools.py"
+
+> The ready-to-run example is available [here](#ready-to-run-example)!
+
+## Understanding the Tool System
+
+The SDK's tool system is built around three core components:
+
+1. **Action** - Defines input parameters (what the tool accepts)
+2. **Observation** - Defines output data (what the tool returns)
+3. **Executor** - Implements the tool's logic (what the tool does)
+
+These components are tied together by a **ToolDefinition** that registers the tool with the agent.
+
+## Built-in Tools
+
+The tools package ([source code](https://github.com/OpenHands/software-agent-sdk/tree/main/openhands-tools/openhands/tools)) provides a bunch of built-in tools that follow these patterns.
+
+```python icon="python" wrap theme={null}
+from openhands.tools import BashTool, FileEditorTool
+from openhands.tools.preset import get_default_tools
+
+# Use specific tools
+agent = Agent(llm=llm, tools=[BashTool.create(), FileEditorTool.create()])
+
+# Or use preset
+tools = get_default_tools()
+agent = Agent(llm=llm, tools=tools)
+```
+
+<Tip>
+  See [source code](https://github.com/OpenHands/software-agent-sdk/tree/main/openhands-tools/openhands/tools) for the complete list of available tools and design philosophy.
+</Tip>
+
+## Creating a Custom Tool
+
+Here's a minimal example of creating a custom grep tool:
+
+<Steps>
+  <Step>
+    ### Define the Action
+
+    Defines input parameters (what the tool accepts)
+
+    ```python icon="python" wrap theme={null}
+    class GrepAction(Action):
+        pattern: str = Field(description="Regex to search for")
+        path: str = Field(
+            default=".",
+            description="Directory to search (absolute or relative)"
+        )
+        include: str | None = Field(
+            default=None,
+            description="Optional glob to filter files (e.g. '*.py')"
+        )
+    ```
+  </Step>
+
+  <Step>
+    ### Define the Observation
+
+    Defines output data (what the tool returns)
+
+    ```python icon="python" wrap theme={null}
+    class GrepObservation(Observation):
+        matches: list[str] = Field(default_factory=list)
+        files: list[str] = Field(default_factory=list)
+        count: int = 0
+
+        @property
+        def to_llm_content(self) -> Sequence[TextContent | ImageContent]:
+            if not self.count:
+                return [TextContent(text="No matches found.")]
+            files_list = "\n".join(f"- {f}" for f in self.files[:20])
+            sample = "\n".join(self.matches[:10])
+            more = "\n..." if self.count > 10 else ""
+            ret = (
+                f"Found {self.count} matching lines.\n"
+                f"Files:\n{files_list}\n"
+                f"Sample:\n{sample}{more}"
+            )
+            return [TextContent(text=ret)]
+    ```
+
+    <Note>
+      The to\_llm\_content() property formats observations for the LLM.
+    </Note>
+  </Step>
+
+  <Step>
+    ### Define the Executor
+
+    Implements the tool’s logic (what the tool does)
+
+    ```python icon="python" wrap theme={null}
+    class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
+        def __init__(self, terminal: TerminalExecutor):
+            self.terminal: TerminalExecutor = terminal
+
+        def __call__(
+            self,
+            action: GrepAction,
+            conversation=None,
+        ) -> GrepObservation:
+            root = os.path.abspath(action.path)
+            pat = shlex.quote(action.pattern)
+            root_q = shlex.quote(root)
+
+            # Use grep -r; add --include when provided
+            if action.include:
+                inc = shlex.quote(action.include)
+                cmd = f"grep -rHnE --include {inc} {pat} {root_q}"
+            else:
+                cmd = f"grep -rHnE {pat} {root_q}"
+            cmd += " 2>/dev/null | head -100"
+            result = self.terminal(TerminalAction(command=cmd))
+
+            matches: list[str] = []
+            files: set[str] = set()
+
+            # grep returns exit code 1 when no matches; treat as empty
+            output_text = result.text
+
+            if output_text.strip():
+                for line in output_text.strip().splitlines():
+                    matches.append(line)
+                    # Expect "path:line:content"
+                    # take the file part before first ":"
+                    file_path = line.split(":", 1)[0]
+                    if file_path:
+                        files.add(os.path.abspath(file_path))
+
+            return GrepObservation(
+                matches=matches,
+                files=sorted(files),
+                count=len(matches),
+            )
+    ```
+  </Step>
+
+  <Step>
+    ### Finally, define the tool
+
+    ```python icon="python" wrap theme={null}
+    class GrepTool(ToolDefinition[GrepAction, GrepObservation]):
+        """Custom grep tool that searches file contents using regular expressions."""
+
+        @classmethod
+        def create(
+            cls,
+            conv_state,
+            terminal_executor: TerminalExecutor | None = None
+        ) -> Sequence[ToolDefinition]:
+            """Create GrepTool instance with a GrepExecutor.
+
+            Args:
+                conv_state: Conversation state to get
+                    working directory from.
+                terminal_executor: Optional terminal executor to reuse.
+                    If not provided, a new one will be created.
+
+            Returns:
+                A sequence containing a single GrepTool instance.
+            """
+            if terminal_executor is None:
+                terminal_executor = TerminalExecutor(
+                    working_dir=conv_state.workspace.working_dir
+                )
+            grep_executor = GrepExecutor(terminal_executor)
+
+            return [
+                cls(
+                    description=_GREP_DESCRIPTION,
+                    action_type=GrepAction,
+                    observation_type=GrepObservation,
+                    executor=grep_executor,
+                )
+            ]
+    ```
+  </Step>
+</Steps>
+
+## Good to know
+
+### Tool Registration
+
+Tools are registered using `register_tool()` and referenced by name:
+
+```python icon="python" wrap theme={null}
+# Register a simple tool class
+register_tool("FileEditorTool", FileEditorTool)
+
+# Register a factory function that creates multiple tools
+register_tool("BashAndGrepToolSet", _make_bash_and_grep_tools)
+
+# Use registered tools by name
+tools = [
+    Tool(name="FileEditorTool"),
+    Tool(name="BashAndGrepToolSet"),
+]
+```
+
+### Factory Functions
+
+Tool factory functions receive `conv_state` as a parameter, allowing access to workspace information:
+
+```python icon="python" wrap theme={null}
+def _make_bash_and_grep_tools(conv_state) -> list[ToolDefinition]:
+    """Create execute_bash and custom grep tools sharing one executor."""
+    bash_executor = BashExecutor(
+        working_dir=conv_state.workspace.working_dir
+    )
+    # Create and configure tools...
+    return [bash_tool, grep_tool]
+```
+
+### Shared Executors
+
+Multiple tools can share executors for efficiency and state consistency:
+
+```python icon="python" wrap theme={null}
+bash_executor = BashExecutor(working_dir=conv_state.workspace.working_dir)
+bash_tool = execute_bash_tool.set_executor(executor=bash_executor)
+
+grep_executor = GrepExecutor(bash_executor)
+grep_tool = ToolDefinition(
+    name="grep",
+    description=_GREP_DESCRIPTION,
+    action_type=GrepAction,
+    observation_type=GrepObservation,
+    executor=grep_executor,
+)
+```
+
+## When to Create Custom Tools
+
+Create custom tools when you need to:
+
+* Combine multiple operations into a single, structured interface
+* Add typed parameters with validation
+* Format complex outputs for LLM consumption
+* Integrate with external APIs or services
+
+## Ready-to-run Example
+
+<Note>
+  This example is available on GitHub: [examples/01\_standalone\_sdk/02\_custom\_tools.py](https://github.com/OpenHands/software-agent-sdk/blob/main/examples/01_standalone_sdk/02_custom_tools.py)
+</Note>
+
+```python icon="python" expandable examples/01_standalone_sdk/02_custom_tools.py theme={null}
+"""Advanced example showing explicit executor usage and custom grep tool."""
+
+import os
+import shlex
+from collections.abc import Sequence
+
+from pydantic import Field, SecretStr
+
+from openhands.sdk import (
+    LLM,
+    Action,
+    Agent,
+    Conversation,
+    Event,
+    ImageContent,
+    LLMConvertibleEvent,
+    Observation,
+    TextContent,
+    ToolDefinition,
+    get_logger,
+)
+from openhands.sdk.tool import (
+    Tool,
+    ToolExecutor,
+    register_tool,
+)
+from openhands.tools.file_editor import FileEditorTool
+from openhands.tools.terminal import (
+    TerminalAction,
+    TerminalExecutor,
+    TerminalTool,
+)
+
+
+logger = get_logger(__name__)
+
+# --- Action / Observation ---
+
+
+class GrepAction(Action):
+    pattern: str = Field(description="Regex to search for")
+    path: str = Field(
+        default=".", description="Directory to search (absolute or relative)"
+    )
+    include: str | None = Field(
+        default=None, description="Optional glob to filter files (e.g. '*.py')"
+    )
+
+
+class GrepObservation(Observation):
+    matches: list[str] = Field(default_factory=list)
+    files: list[str] = Field(default_factory=list)
+    count: int = 0
+
+    @property
+    def to_llm_content(self) -> Sequence[TextContent | ImageContent]:
+        if not self.count:
+            return [TextContent(text="No matches found.")]
+        files_list = "\n".join(f"- {f}" for f in self.files[:20])
+        sample = "\n".join(self.matches[:10])
+        more = "\n..." if self.count > 10 else ""
+        ret = (
+            f"Found {self.count} matching lines.\n"
+            f"Files:\n{files_list}\n"
+            f"Sample:\n{sample}{more}"
+        )
+        return [TextContent(text=ret)]
+
+
+# --- Executor ---
+
+
+class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
+    def __init__(self, terminal: TerminalExecutor):
+        self.terminal: TerminalExecutor = terminal
+
+    def __call__(self, action: GrepAction, conversation=None) -> GrepObservation:  # noqa: ARG002
+        root = os.path.abspath(action.path)
+        pat = shlex.quote(action.pattern)
+        root_q = shlex.quote(root)
+
+        # Use grep -r; add --include when provided
+        if action.include:
+            inc = shlex.quote(action.include)
+            cmd = f"grep -rHnE --include {inc} {pat} {root_q} 2>/dev/null | head -100"
+        else:
+            cmd = f"grep -rHnE {pat} {root_q} 2>/dev/null | head -100"
+
+        result = self.terminal(TerminalAction(command=cmd))
+
+        matches: list[str] = []
+        files: set[str] = set()
+
+        # grep returns exit code 1 when no matches; treat as empty
+        output_text = result.text
+
+        if output_text.strip():
+            for line in output_text.strip().splitlines():
+                matches.append(line)
+                # Expect "path:line:content" — take the file part before first ":"
+                file_path = line.split(":", 1)[0]
+                if file_path:
+                    files.add(os.path.abspath(file_path))
+
+        return GrepObservation(matches=matches, files=sorted(files), count=len(matches))
+
+
+# Tool description
+_GREP_DESCRIPTION = """Fast content search tool.
+* Searches file contents using regular expressions
+* Supports full regex syntax (eg. "log.*Error", "function\\s+\\w+", etc.)
+* Filter files by pattern with the include parameter (eg. "*.js", "*.{ts,tsx}")
+* Returns matching file paths sorted by modification time.
+* Only the first 100 results are returned. Consider narrowing your search with stricter regex patterns or provide path parameter if you need more results.
+* Use this tool when you need to find files containing specific patterns
+* When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead
+"""  # noqa: E501
+
+
+# --- Tool Definition ---
+
+
+class GrepTool(ToolDefinition[GrepAction, GrepObservation]):
+    """A custom grep tool that searches file contents using regular expressions."""
+
+    @classmethod
+    def create(
+        cls, conv_state, terminal_executor: TerminalExecutor | None = None
+    ) -> Sequence[ToolDefinition]:
+        """Create GrepTool instance with a GrepExecutor.
+
+        Args:
+            conv_state: Conversation state to get working directory from.
+            terminal_executor: Optional terminal executor to reuse. If not provided,
+                         a new one will be created.
+
+        Returns:
+            A sequence containing a single GrepTool instance.
+        """
+        if terminal_executor is None:
+            terminal_executor = TerminalExecutor(
+                working_dir=conv_state.workspace.working_dir
+            )
+        grep_executor = GrepExecutor(terminal_executor)
+
+        return [
+            cls(
+                description=_GREP_DESCRIPTION,
+                action_type=GrepAction,
+                observation_type=GrepObservation,
+                executor=grep_executor,
+            )
+        ]
+
+
+# Configure LLM
+api_key = os.getenv("LLM_API_KEY")
+assert api_key is not None, "LLM_API_KEY environment variable is not set."
+model = os.getenv("LLM_MODEL", "anthropic/claude-sonnet-4-5-20250929")
+base_url = os.getenv("LLM_BASE_URL")
+llm = LLM(
+    usage_id="agent",
+    model=model,
+    base_url=base_url,
+    api_key=SecretStr(api_key),
+)
+
+# Tools - demonstrating both simplified and advanced patterns
+cwd = os.getcwd()
+
+
+def _make_bash_and_grep_tools(conv_state) -> list[ToolDefinition]:
+    """Create terminal and custom grep tools sharing one executor."""
+
+    terminal_executor = TerminalExecutor(working_dir=conv_state.workspace.working_dir)
+    # terminal_tool = terminal_tool.set_executor(executor=terminal_executor)
+    terminal_tool = TerminalTool.create(conv_state, executor=terminal_executor)[0]
+
+    # Use the GrepTool.create() method with shared terminal_executor
+    grep_tool = GrepTool.create(conv_state, terminal_executor=terminal_executor)[0]
+
+    return [terminal_tool, grep_tool]
+
+
+register_tool("BashAndGrepToolSet", _make_bash_and_grep_tools)
+
+tools = [
+    Tool(name=FileEditorTool.name),
+    Tool(name="BashAndGrepToolSet"),
+]
+
+# Agent
+agent = Agent(llm=llm, tools=tools)
+
+llm_messages = []  # collect raw LLM messages
+
+
+def conversation_callback(event: Event):
+    if isinstance(event, LLMConvertibleEvent):
+        llm_messages.append(event.to_llm_message())
+
+
+conversation = Conversation(
+    agent=agent, callbacks=[conversation_callback], workspace=cwd
+)
+
+conversation.send_message(
+    "Hello! Can you use the grep tool to find all files "
+    "containing the word 'class' in this project, then create a summary file listing them? "  # noqa: E501
+    "Use the pattern 'class' to search and include only Python files with '*.py'."  # noqa: E501
+)
+conversation.run()
+
+conversation.send_message("Great! Now delete that file.")
+conversation.run()
+
+print("=" * 100)
+print("Conversation finished. Got the following LLM messages:")
+for i, message in enumerate(llm_messages):
+    print(f"Message {i}: {str(message)[:200]}")
+
+# Report cost
+cost = llm.metrics.accumulated_cost
+print(f"EXAMPLE_COST: {cost}")
+```
+
+You can run the example code as-is.
+
+<Note>
+  The model name should follow the [LiteLLM convention](https://models.litellm.ai/): `provider/model_name` (e.g., `anthropic/claude-sonnet-4-5-20250929`, `openai/gpt-4o`).
+  The `LLM_API_KEY` should be the API key for your chosen provider.
+</Note>
+
+<CodeGroup>
+  <CodeBlock language="bash" filename="Bring-your-own provider key" icon="terminal" wrap>
+    {`export LLM_API_KEY="your-api-key"\nexport LLM_MODEL="anthropic/claude-sonnet-4-5-20250929"  # or openai/gpt-4o, etc.\ncd software-agent-sdk\nuv run python ${path_to_script_0}`}
+  </CodeBlock>
+
+  <CodeBlock language="bash" filename="OpenHands Cloud" icon="terminal" wrap>
+    {`# https://app.all-hands.dev/settings/api-keys\nexport LLM_API_KEY="your-openhands-api-key"\nexport LLM_MODEL="openhands/claude-sonnet-4-5-20250929"\ncd software-agent-sdk\nuv run python ${path_to_script_0}`}
+  </CodeBlock>
+</CodeGroup>
+
+<Tip>
+  **ChatGPT Plus/Pro subscribers**: You can use `LLM.subscription_login()` to authenticate with your ChatGPT account and access Codex models without consuming API credits. See the [LLM Subscriptions guide](/sdk/guides/llm-subscriptions) for details.
+</Tip>
+
+## Next Steps
+
+* **[Model Context Protocol (MCP) Integration](/sdk/guides/mcp)** - Use Model Context Protocol servers
+* **[Tools Package Source Code](https://github.com/OpenHands/software-agent-sdk/tree/main/openhands-tools/openhands/tools)** - Built-in tools implementation
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.openhands.dev/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Agent Skills & Context
+
+> Skills add specialized behaviors, domain knowledge, and context-aware triggers to your agent through structured prompts.
+
+export const path_to_script_3 = "examples/05_skills_and_plugins/01_loading_agentskills/main.py"
+
+export const path_to_script_2 = "examples/01_standalone_sdk/03_activate_skill.py"
+
+export const path_to_script_1 = "examples/01_standalone_sdk/43_mixed_marketplace_skills/main.py"
+
+export const path_to_script_0 = "examples/05_skills_and_plugins/03_managing_installed_skills/main.py"
+
+This guide shows how to implement skills in the SDK. For conceptual overview, see [Skills Overview](/overview/skills).
+
+OpenHands supports an **extended version** of the [AgentSkills standard](https://agentskills.io/specification) with optional keyword triggers.
+
+## Context Loading Methods
+
+| Method                     | When Content Loads    | Use Case                            |
+| -------------------------- | --------------------- | ----------------------------------- |
+| **Always-loaded**          | At conversation start | Repository rules, coding standards  |
+| **Trigger-loaded**         | When keywords match   | Specialized tasks, domain knowledge |
+| **Progressive disclosure** | Agent reads on demand | Large reference docs (AgentSkills)  |
+
+## Always-Loaded Context
+
+Content that's always in the system prompt.
+
+### Option 1: `AGENTS.md` (Auto-loaded)
+
+Place `AGENTS.md` at your repo root - it's loaded automatically. See [Permanent Context](/overview/skills/repo).
+
+```python icon="python" focus={3, 4} theme={null}
+from openhands.sdk.context.skills import load_project_skills
+
+# Automatically finds AGENTS.md, CLAUDE.md, GEMINI.md at workspace root
+skills = load_project_skills(workspace_dir="/path/to/repo")
+agent_context = AgentContext(skills=skills)
+```
+
+### Option 2: Inline Skill (Code-defined)
+
+```python icon="python" focus={5-11} theme={null}
+from openhands.sdk import AgentContext
+from openhands.sdk.context import Skill
+
+agent_context = AgentContext(
+    skills=[
+        Skill(
+            name="code-style",
+            content="Always use type hints in Python.",
+            trigger=None,  # No trigger = always loaded
+        ),
+    ]
+)
+```
+
+## Trigger-Loaded Context
+
+Content injected when keywords appear in user messages. See [Keyword-Triggered Skills](/overview/skills/keyword).
+
+```python icon="python" focus={6} theme={null}
+from openhands.sdk.context import Skill, KeywordTrigger
+
+Skill(
+    name="encryption-helper",
+    content="Use the encrypt.sh script to encrypt messages.",
+    trigger=KeywordTrigger(keywords=["encrypt", "decrypt"]),
+)
+```
+
+When user says "encrypt this", the content is injected into the message:
+
+```xml icon="file" theme={null}
+<EXTRA_INFO>
+The following information has been included based on a keyword match for "encrypt".
+Skill location: /path/to/encryption-helper
+
+Use the encrypt.sh script to encrypt messages.
+</EXTRA_INFO>
+```
+
+## Progressive Disclosure (AgentSkills Standard)
+
+For the agent to trigger skills, use the [AgentSkills standard](https://agentskills.io/specification) `SKILL.md` format. The agent sees a summary and reads full content on demand.
+
+```python icon="python" theme={null}
+from openhands.sdk.context.skills import load_skills_from_dir
+
+# Load SKILL.md files from a directory
+_, _, agent_skills = load_skills_from_dir("/path/to/skills")
+agent_context = AgentContext(skills=list(agent_skills.values()))
+```
+
+Skills are listed in the system prompt:
+
+```xml icon="file" theme={null}
+<available_skills>
+  <skill>
+    <name>code-style</name>
+    <description>Project coding standards.</description>
+    <location>/path/to/code-style/SKILL.md</location>
+  </skill>
+</available_skills>
+```
+
+<Tip>
+  Add `triggers` to a SKILL.md for **both** progressive disclosure AND automatic injection when keywords match.
+</Tip>
+
+## Managing Installed Skills
+
+You can install AgentSkills into a persistent directory and manage them through
+`openhands.sdk.skills`. Skills are stored under
+`~/.openhands/skills/installed/` with a `.installed.json` metadata file that
+records an `enabled` flag. `list_installed_skills()` returns all installed
+skills, while `load_installed_skills()` returns only those with
+`enabled=true`.
+
+The public lifecycle API includes `install_skill()`, `update_skill()`,
+`enable_skill()`, `disable_skill()`, and `uninstall_skill()`, which gives the
+CLI a clean SDK surface for `/skill install`, `/skill enable`,
+`/skill disable`, and `/skill uninstall`.
+
+### Installed Skill Lifecycle Example
+
+This example mirrors the installed-plugin lifecycle example, but for
+AgentSkills. It installs sample skills, lists them, toggles the
+persistent `enabled` flag, and uninstalls one skill while leaving the
+other available.
+
+<Note>
+  Source: [examples/05\_skills\_and\_plugins/03\_managing\_installed\_skills/main.py](https://github.com/OpenHands/software-agent-sdk/blob/main/examples/05_skills_and_plugins/03_managing_installed_skills/main.py)
+</Note>
+
+```python icon="python" expandable examples/05_skills_and_plugins/03_managing_installed_skills/main.py theme={null}
+"""Example: Installing and Managing Skills
+
+This example demonstrates installed skill lifecycle operations in the SDK:
+
+1. Install skills from local paths into persistent storage
+2. List tracked skills and load only the enabled ones
+3. Inspect the `.installed.json` metadata file and `enabled` flag
+4. Disable and re-enable a skill without reinstalling it
+5. Uninstall a skill while leaving other installed skills available
+
+For marketplace installation flows, see:
+`examples/01_standalone_sdk/43_mixed_marketplace_skills/`.
+"""
+
+import json
+import tempfile
+from pathlib import Path
+
+from openhands.sdk.skills import (
+    disable_skill,
+    enable_skill,
+    install_skill,
+    list_installed_skills,
+    load_installed_skills,
+    uninstall_skill,
+)
+
+
+script_dir = Path(__file__).resolve().parent
+example_skills_dir = script_dir.parent / "01_loading_agentskills" / "example_skills"
+
+
+def print_state(label: str, installed_dir: Path) -> None:
+    """Print tracked, loaded, and persisted skill state."""
+    print(f"\n{label}")
+    print("-" * len(label))
+
+    installed = list_installed_skills(installed_dir=installed_dir)
+    print("Tracked skills:")
+    for info in installed:
+        print(f"  - {info.name} (enabled={info.enabled}, source={info.source})")
+
+    loaded = load_installed_skills(installed_dir=installed_dir)
+    print(f"Loaded skills: {[skill.name for skill in loaded]}")
+
+    metadata = json.loads((installed_dir / ".installed.json").read_text())
+    print("Metadata file:")
+    print(json.dumps(metadata, indent=2))
+
+
+def demo_install_skills(installed_dir: Path) -> list[str]:
+    """Install the sample skills into the isolated installed directory."""
+    print("\n" + "=" * 60)
+    print("DEMO 1: Installing local skills")
+    print("=" * 60)
+
+    installed_names: list[str] = []
+    for skill_dir in sorted(example_skills_dir.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        info = install_skill(source=str(skill_dir), installed_dir=installed_dir)
+        installed_names.append(info.name)
+        print(f"✓ Installed: {info.name}")
+        print(f"  Source: {info.source}")
+        print(f"  Path: {info.install_path}")
+
+    return installed_names
+
+
+def demo_list_and_load_skills(installed_dir: Path) -> None:
+    """List tracked skills and load them as runtime Skill objects."""
+    print("\n" + "=" * 60)
+    print("DEMO 2: Listing and loading installed skills")
+    print("=" * 60)
+
+    installed = list_installed_skills(installed_dir=installed_dir)
+    print("Tracked skills:")
+    for info in installed:
+        desc = (info.description or "No description")[:60]
+        print(f"  - {info.name} (enabled={info.enabled})")
+        print(f"    Description: {desc}...")
+
+    loaded = load_installed_skills(installed_dir=installed_dir)
+    print(f"\nLoaded {len(loaded)} skill(s):")
+    for skill in loaded:
+        desc = (skill.description or "No description")[:60]
+        print(f"  - {skill.name}: {desc}...")
+
+
+def demo_enable_disable_skill(installed_dir: Path, skill_name: str) -> None:
+    """Disable then re-enable a skill and show the persisted metadata."""
+    print("\n" + "=" * 60)
+    print("DEMO 3: Disabling and re-enabling a skill")
+    print("=" * 60)
+
+    print_state("Before disable", installed_dir)
+
+    assert disable_skill(skill_name, installed_dir=installed_dir) is True
+    print_state("After disable", installed_dir)
+    assert skill_name not in [
+        skill.name for skill in load_installed_skills(installed_dir=installed_dir)
+    ]
+
+    metadata = json.loads((installed_dir / ".installed.json").read_text())
+    assert metadata["skills"][skill_name]["enabled"] is False
+
+    assert enable_skill(skill_name, installed_dir=installed_dir) is True
+    print_state("After re-enable", installed_dir)
+
+    metadata = json.loads((installed_dir / ".installed.json").read_text())
+    assert metadata["skills"][skill_name]["enabled"] is True
+    assert skill_name in [
+        skill.name for skill in load_installed_skills(installed_dir=installed_dir)
+    ]
+
+
+def demo_uninstall_skill(
+    installed_dir: Path, skill_name: str, remaining_skill_name: str
+) -> None:
+    """Uninstall one skill and confirm the other skill remains available."""
+    print("\n" + "=" * 60)
+    print("DEMO 4: Uninstalling a skill")
+    print("=" * 60)
+
+    assert uninstall_skill(skill_name, installed_dir=installed_dir) is True
+    print_state("After uninstall", installed_dir)
+
+    assert not (installed_dir / skill_name).exists()
+    metadata = json.loads((installed_dir / ".installed.json").read_text())
+    assert skill_name not in metadata["skills"]
+    assert remaining_skill_name in metadata["skills"]
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory() as tmpdir:
+        installed_dir = Path(tmpdir) / "installed-skills"
+        installed_dir.mkdir(parents=True)
+
+        installed_names = demo_install_skills(installed_dir)
+        demo_list_and_load_skills(installed_dir)
+        demo_enable_disable_skill(installed_dir, skill_name="rot13-encryption")
+        demo_uninstall_skill(
+            installed_dir,
+            skill_name="rot13-encryption",
+            remaining_skill_name="code-style-guide",
+        )
+
+        remaining_names = [
+            info.name for info in list_installed_skills(installed_dir=installed_dir)
+        ]
+        assert remaining_names == ["code-style-guide"]
+        assert sorted(installed_names) == ["code-style-guide", "rot13-encryption"]
+
+    print("\nEXAMPLE_COST: 0")
+```
+
+You can run the example code as-is.
+
+<Note>
+  The model name should follow the [LiteLLM convention](https://models.litellm.ai/): `provider/model_name` (e.g., `anthropic/claude-sonnet-4-5-20250929`, `openai/gpt-4o`).
+  The `LLM_API_KEY` should be the API key for your chosen provider.
+</Note>
+
+<CodeGroup>
+  <CodeBlock language="bash" filename="Bring-your-own provider key" icon="terminal" wrap>
+    {`export LLM_API_KEY="your-api-key"\nexport LLM_MODEL="anthropic/claude-sonnet-4-5-20250929"  # or openai/gpt-4o, etc.\ncd software-agent-sdk\nuv run python ${path_to_script_0}`}
+  </CodeBlock>
+
+  <CodeBlock language="bash" filename="OpenHands Cloud" icon="terminal" wrap>
+    {`# https://app.all-hands.dev/settings/api-keys\nexport LLM_API_KEY="your-openhands-api-key"\nexport LLM_MODEL="openhands/claude-sonnet-4-5-20250929"\ncd software-agent-sdk\nuv run python ${path_to_script_0}`}
+  </CodeBlock>
+</CodeGroup>
+
+<Tip>
+  **ChatGPT Plus/Pro subscribers**: You can use `LLM.subscription_login()` to authenticate with your ChatGPT account and access Codex models without consuming API credits. See the [LLM Subscriptions guide](/sdk/guides/llm-subscriptions) for details.
+</Tip>
+
+### Installing Skills from a Marketplace
+
+Use a marketplace when you want to install a curated mix of local and remote
+AgentSkills in one step. The example below shows how to define a marketplace,
+install all listed skills, and inspect the installed metadata.
+
+<Note>
+  Source: [examples/01\_standalone\_sdk/43\_mixed\_marketplace\_skills/main.py](https://github.com/OpenHands/software-agent-sdk/blob/main/examples/01_standalone_sdk/43_mixed_marketplace_skills/main.py)
+</Note>
+
+```python icon="python" expandable examples/01_standalone_sdk/43_mixed_marketplace_skills/main.py theme={null}
+"""Example: Mixed Marketplace with Local and Remote Skills
+
+This example demonstrates how to create a marketplace that includes both:
+1. Local skills hosted in your project directory
+2. Remote skills from GitHub (OpenHands/extensions repository)
+
+The marketplace.json schema supports source paths in these formats:
+- Local paths: ./path, ../path, /absolute/path, ~/path, file:///path
+- GitHub URLs: https://github.com/{owner}/{repo}/blob/{branch}/{path}
+
+This pattern is useful for teams that want to:
+- Maintain their own custom skills locally
+- Reference specific skills from remote repositories
+- Create a curated skill set for their specific workflows
+
+Directory Structure:
+    43_mixed_marketplace_skills/
+    ├── .plugin/
+    │   └── marketplace.json     # Marketplace with local and remote skills
+    ├── skills/
+    │   └── greeting-helper/
+    │       └── SKILL.md         # Local skill content
+    ├── main.py                  # This file
+    └── README.md                # Documentation
+
+Usage:
+    # Install all skills from marketplace to ~/.openhands/skills/installed/
+    python main.py --install
+
+    # Force reinstall (overwrite existing)
+    python main.py --install --force
+
+    # Show installed skills
+    python main.py --list
+"""
+
+import sys
+from pathlib import Path
+
+from openhands.sdk.plugin import Marketplace
+from openhands.sdk.skills import (
+    install_skills_from_marketplace,
+    list_installed_skills,
+)
+
+
+def main():
+    script_dir = Path(__file__).parent
+
+    if "--list" in sys.argv:
+        # List installed skills
+        print("=" * 80)
+        print("Installed Skills")
+        print("=" * 80)
+        installed = list_installed_skills()
+        if not installed:
+            print("\nNo skills installed.")
+            print("Run with --install to install skills from the marketplace.")
+        else:
+            for info in installed:
+                desc = (info.description or "No description")[:60]
+                print(f"\n  {info.name}")
+                print(f"    Description: {desc}...")
+                print(f"    Source: {info.source}")
+        return
+
+    if "--install" in sys.argv:
+        # Install skills from marketplace
+        print("=" * 80)
+        print("Installing Skills from Marketplace")
+        print("=" * 80)
+        print(f"\nMarketplace directory: {script_dir}")
+
+        force = "--force" in sys.argv
+        installed = install_skills_from_marketplace(script_dir, force=force)
+
+        print(f"\n\nInstalled {len(installed)} skills:")
+        for info in installed:
+            print(f"  - {info.name}")
+
+        # Show all installed skills
+        print("\n" + "=" * 80)
+        print("All Installed Skills")
+        print("=" * 80)
+        all_installed = list_installed_skills()
+        for info in all_installed:
+            desc = (info.description or "No description")[:50]
+            print(f"  - {info.name}: {desc}...")
+        return
+
+    # Default: show marketplace info
+    print("=" * 80)
+    print("Marketplace Information")
+    print("=" * 80)
+    print(f"\nMarketplace directory: {script_dir}")
+
+    marketplace = Marketplace.load(script_dir)
+    print(f"Name: {marketplace.name}")
+    print(f"Description: {marketplace.description}")
+    print(f"Skills defined: {len(marketplace.skills)}")
+
+    print("\nSkills:")
+    for entry in marketplace.skills:
+        source_type = "remote" if entry.source.startswith("http") else "local"
+        print(f"  - {entry.name} ({source_type})")
+        print(f"    Source: {entry.source}")
+        if entry.description:
+            print(f"    Description: {entry.description}")
+
+    print("\n" + "-" * 80)
+    print("Usage:")
+    print("  python main.py --install        # Install all skills")
+    print("  python main.py --install --force # Force reinstall")
+    print("  python main.py --list           # List installed skills")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+You can run the example code as-is.
+
+<Note>
+  The model name should follow the [LiteLLM convention](https://models.litellm.ai/): `provider/model_name` (e.g., `anthropic/claude-sonnet-4-5-20250929`, `openai/gpt-4o`).
+  The `LLM_API_KEY` should be the API key for your chosen provider.
+</Note>
+
+<CodeGroup>
+  <CodeBlock language="bash" filename="Bring-your-own provider key" icon="terminal" wrap>
+    {`export LLM_API_KEY="your-api-key"\nexport LLM_MODEL="anthropic/claude-sonnet-4-5-20250929"  # or openai/gpt-4o, etc.\ncd software-agent-sdk\nuv run python ${path_to_script_1}`}
+  </CodeBlock>
+
+  <CodeBlock language="bash" filename="OpenHands Cloud" icon="terminal" wrap>
+    {`# https://app.all-hands.dev/settings/api-keys\nexport LLM_API_KEY="your-openhands-api-key"\nexport LLM_MODEL="openhands/claude-sonnet-4-5-20250929"\ncd software-agent-sdk\nuv run python ${path_to_script_1}`}
+  </CodeBlock>
+</CodeGroup>
+
+<Tip>
+  **ChatGPT Plus/Pro subscribers**: You can use `LLM.subscription_login()` to authenticate with your ChatGPT account and access Codex models without consuming API credits. See the [LLM Subscriptions guide](/sdk/guides/llm-subscriptions) for details.
+</Tip>
+
+***
+
+## Full Example
+
+<Note>
+  Full example: [examples/01\_standalone\_sdk/03\_activate\_skill.py](https://github.com/OpenHands/software-agent-sdk/blob/main/examples/01_standalone_sdk/03_activate_skill.py)
+</Note>
+
+```python icon="python" expandable examples/01_standalone_sdk/03_activate_skill.py theme={null}
+import os
+
+from pydantic import SecretStr
+
+from openhands.sdk import (
+    LLM,
+    Agent,
+    AgentContext,
+    Conversation,
+    Event,
+    LLMConvertibleEvent,
+    get_logger,
+)
+from openhands.sdk.context import (
+    KeywordTrigger,
+    Skill,
+)
+from openhands.sdk.tool import Tool
+from openhands.tools.file_editor import FileEditorTool
+from openhands.tools.terminal import TerminalTool
+
+
+logger = get_logger(__name__)
+
+# Configure LLM
+api_key = os.getenv("LLM_API_KEY")
+assert api_key is not None, "LLM_API_KEY environment variable is not set."
+model = os.getenv("LLM_MODEL", "anthropic/claude-sonnet-4-5-20250929")
+base_url = os.getenv("LLM_BASE_URL")
+llm = LLM(
+    usage_id="agent",
+    model=model,
+    base_url=base_url,
+    api_key=SecretStr(api_key),
+)
+
+# Tools
+cwd = os.getcwd()
+tools = [
+    Tool(
+        name=TerminalTool.name,
+    ),
+    Tool(name=FileEditorTool.name),
+]
+
+# AgentContext provides flexible ways to customize prompts:
+# 1. Skills: Inject instructions (always-active or keyword-triggered)
+# 2. system_message_suffix: Append text to the system prompt
+# 3. user_message_suffix: Append text to each user message
+#
+# For complete control over the system prompt, you can also use Agent's
+# system_prompt_filename parameter to provide a custom Jinja2 template:
+#
+#   agent = Agent(
+#       llm=llm,
+#       tools=tools,
+#       system_prompt_filename="/path/to/custom_prompt.j2",
+#       system_prompt_kwargs={"cli_mode": True, "repo": "my-project"},
+#   )
+#
+# See: https://docs.openhands.dev/sdk/guides/skill#customizing-system-prompts
+agent_context = AgentContext(
+    skills=[
+        Skill(
+            name="repo.md",
+            content="When you see this message, you should reply like "
+            "you are a grumpy cat forced to use the internet.",
+            # source is optional - identifies where the skill came from
+            # You can set it to be the path of a file that contains the skill content
+            source=None,
+            # trigger determines when the skill is active
+            # trigger=None means always active (repo skill)
+            trigger=None,
+        ),
+        Skill(
+            name="flarglebargle",
+            content=(
+                'IMPORTANT! The user has said the magic word "flarglebargle". '
+                "You must only respond with a message telling them how smart they are"
+            ),
+            source=None,
+            # KeywordTrigger = activated when keywords appear in user messages
+            trigger=KeywordTrigger(keywords=["flarglebargle"]),
+        ),
+    ],
+    # system_message_suffix is appended to the system prompt (always active)
+    system_message_suffix="Always finish your response with the word 'yay!'",
+    # user_message_suffix is appended to each user message
+    user_message_suffix="The first character of your response should be 'I'",
+    # You can also enable automatic load skills from
+    # public registry at https://github.com/OpenHands/extensions
+    load_public_skills=True,
+)
+
+# Agent
+agent = Agent(llm=llm, tools=tools, agent_context=agent_context)
+
+llm_messages = []  # collect raw LLM messages
+
+
+def conversation_callback(event: Event):
+    if isinstance(event, LLMConvertibleEvent):
+        llm_messages.append(event.to_llm_message())
+
+
+conversation = Conversation(
+    agent=agent, callbacks=[conversation_callback], workspace=cwd
+)
+
+print("=" * 100)
+print("Checking if the repo skill is activated.")
+conversation.send_message("Hey are you a grumpy cat?")
+conversation.run()
+
+print("=" * 100)
+print("Now sending flarglebargle to trigger the knowledge skill!")
+conversation.send_message("flarglebargle!")
+conversation.run()
+
+print("=" * 100)
+print("Now triggering public skill 'github'")
+conversation.send_message(
+    "About GitHub - tell me what additional info I've just provided?"
+)
+conversation.run()
+
+print("=" * 100)
+print("Conversation finished. Got the following LLM messages:")
+for i, message in enumerate(llm_messages):
+    print(f"Message {i}: {str(message)[:200]}")
+
+# Report cost
+cost = llm.metrics.accumulated_cost
+print(f"EXAMPLE_COST: {cost}")
+```
+
+You can run the example code as-is.
+
+<Note>
+  The model name should follow the [LiteLLM convention](https://models.litellm.ai/): `provider/model_name` (e.g., `anthropic/claude-sonnet-4-5-20250929`, `openai/gpt-4o`).
+  The `LLM_API_KEY` should be the API key for your chosen provider.
+</Note>
+
+<CodeGroup>
+  <CodeBlock language="bash" filename="Bring-your-own provider key" icon="terminal" wrap>
+    {`export LLM_API_KEY="your-api-key"\nexport LLM_MODEL="anthropic/claude-sonnet-4-5-20250929"  # or openai/gpt-4o, etc.\ncd software-agent-sdk\nuv run python ${path_to_script_2}`}
+  </CodeBlock>
+
+  <CodeBlock language="bash" filename="OpenHands Cloud" icon="terminal" wrap>
+    {`# https://app.all-hands.dev/settings/api-keys\nexport LLM_API_KEY="your-openhands-api-key"\nexport LLM_MODEL="openhands/claude-sonnet-4-5-20250929"\ncd software-agent-sdk\nuv run python ${path_to_script_2}`}
+  </CodeBlock>
+</CodeGroup>
+
+<Tip>
+  **ChatGPT Plus/Pro subscribers**: You can use `LLM.subscription_login()` to authenticate with your ChatGPT account and access Codex models without consuming API credits. See the [LLM Subscriptions guide](/sdk/guides/llm-subscriptions) for details.
+</Tip>
+
+### Creating Skills
+
+Skills are defined with a name, content (the instructions), and an optional trigger:
+
+```python icon="python" focus={3-14} theme={null}
+agent_context = AgentContext(
+    skills=[
+        Skill(
+            name="AGENTS.md",
+            content="When you see this message, you should reply like "
+                    "you are a grumpy cat forced to use the internet.",
+            trigger=None,  # Always active
+        ),
+        Skill(
+            name="flarglebargle",
+            content='IMPORTANT! The user has said the magic word "flarglebargle". '
+                    "You must only respond with a message telling them how smart they are",
+            trigger=KeywordTrigger(keywords=["flarglebargle"]),
+        ),
+    ]
+)
+```
+
+### Keyword Triggers
+
+Use `KeywordTrigger` to activate skills only when specific words appear:
+
+```python icon="python" focus={4} theme={null}
+Skill(
+    name="magic-word",
+    content="Special instructions when magic word is detected",
+    trigger=KeywordTrigger(keywords=["flarglebargle", "sesame"]),
+)
+```
+
+## File-Based Skills (`SKILL.md`)
+
+For reusable skills, use the [AgentSkills standard](https://agentskills.io/specification) directory format.
+
+<Note>
+  Full example: [examples/05\_skills\_and\_plugins/01\_loading\_agentskills/main.py](https://github.com/OpenHands/software-agent-sdk/blob/main/examples/05_skills_and_plugins/01_loading_agentskills/main.py)
+</Note>
+
+### Directory Structure
+
+Each skill is a directory containing:
+
+<Tree>
+  <Tree.Folder name="my-skill/" defaultOpen>
+    <Tree.File name="SKILL.md" />
+
+    <Tree.Folder name="scripts/" defaultOpen>
+      <Tree.File name="helper.sh" />
+    </Tree.Folder>
+
+    <Tree.Folder name="references/" defaultOpen>
+      <Tree.File name="examples.md" />
+    </Tree.Folder>
+
+    <Tree.Folder name="assets/" defaultOpen>
+      <Tree.File name="config.json" />
+    </Tree.Folder>
+  </Tree.Folder>
+</Tree>
+
+where
+
+| Component     | Required | Description                       |
+| ------------- | -------- | --------------------------------- |
+| `SKILL.md`    | Yes      | Skill definition with frontmatter |
+| `scripts/`    | No       | Executable scripts                |
+| `references/` | No       | Reference documentation           |
+| `assets/`     | No       | Static assets                     |
+
+### `SKILL.md` Format
+
+The `SKILL.md` file defines the skill with YAML frontmatter:
+
+```md icon="markdown" theme={null}
+---
+name: my-skill                    # Required (standard)
+description: >                    # Required (standard)
+  A brief description of what this skill does and when to use it.
+license: MIT                      # Optional (standard)
+compatibility: Requires bash      # Optional (standard)
+metadata:                         # Optional (standard)
+  author: your-name
+  version: "1.0"
+triggers:                         # Optional (OpenHands extension)
+  - keyword1
+  - keyword2
+---
+
+# Skill Content
+
+Instructions and documentation for the agent...
+```
+
+#### Frontmatter Fields
+
+| Field           | Required | Description                                                      |
+| --------------- | -------- | ---------------------------------------------------------------- |
+| `name`          | Yes      | Skill identifier (lowercase + hyphens)                           |
+| `description`   | Yes      | What the skill does (shown to agent)                             |
+| `triggers`      | No       | Keywords that auto-activate this skill (**OpenHands extension**) |
+| `license`       | No       | License name                                                     |
+| `compatibility` | No       | Environment requirements                                         |
+| `metadata`      | No       | Custom key-value pairs                                           |
+
+<Tip>
+  Add `triggers` to make your SKILL.md keyword-activated by matching a user prompt. Without triggers, the skill can only be triggered by the agent, not the user.
+</Tip>
+
+### Loading Skills
+
+Use `load_skills_from_dir()` to load all skills from a directory:
+
+```python icon="python" expandable examples/05_skills_and_plugins/01_loading_agentskills/main.py theme={null}
+"""Example: Loading Skills from Disk (AgentSkills Standard)
+
+This example demonstrates how to load skills following the AgentSkills standard
+from a directory on disk.
+
+Skills are modular, self-contained packages that extend an agent's capabilities
+by providing specialized knowledge, workflows, and tools. They follow the
+AgentSkills standard which includes:
+- SKILL.md file with frontmatter metadata (name, description, triggers)
+- Optional resource directories: scripts/, references/, assets/
+
+The example_skills/ directory contains two skills:
+- rot13-encryption: Has triggers (encrypt, decrypt) - listed in <available_skills>
+  AND content auto-injected when triggered
+- code-style-guide: No triggers - listed in <available_skills> for on-demand access
+
+All SKILL.md files follow the AgentSkills progressive disclosure model:
+they are listed in <available_skills> with name, description, and location.
+Skills with triggers get the best of both worlds: automatic content injection
+when triggered, plus the agent can proactively read them anytime.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+from pydantic import SecretStr
+
+from openhands.sdk import LLM, Agent, AgentContext, Conversation
+from openhands.sdk.context.skills import (
+    discover_skill_resources,
+    load_skills_from_dir,
+)
+from openhands.sdk.tool import Tool
+from openhands.tools.file_editor import FileEditorTool
+from openhands.tools.terminal import TerminalTool
+
+
+# Get the directory containing this script
+script_dir = Path(__file__).parent
+example_skills_dir = script_dir / "example_skills"
+
+# =========================================================================
+# Part 1: Loading Skills from a Directory
+# =========================================================================
+print("=" * 80)
+print("Part 1: Loading Skills from a Directory")
+print("=" * 80)
+
+print(f"Loading skills from: {example_skills_dir}")
+
+# Discover resources in the skill directory
+skill_subdir = example_skills_dir / "rot13-encryption"
+resources = discover_skill_resources(skill_subdir)
+print("\nDiscovered resources in rot13-encryption/:")
+print(f"  - scripts: {resources.scripts}")
+print(f"  - references: {resources.references}")
+print(f"  - assets: {resources.assets}")
+
+# Load skills from the directory
+repo_skills, knowledge_skills, agent_skills = load_skills_from_dir(example_skills_dir)
+
+print("\nLoaded skills from directory:")
+print(f"  - Repo skills: {list(repo_skills.keys())}")
+print(f"  - Knowledge skills: {list(knowledge_skills.keys())}")
+print(f"  - Agent skills (SKILL.md): {list(agent_skills.keys())}")
+
+# Access the loaded skill and show all AgentSkills standard fields
+if agent_skills:
+    skill_name = next(iter(agent_skills))
+    loaded_skill = agent_skills[skill_name]
+    print(f"\nDetails for '{skill_name}' (AgentSkills standard fields):")
+    print(f"  - Name: {loaded_skill.name}")
+    desc = loaded_skill.description or ""
+    print(f"  - Description: {desc[:70]}...")
+    print(f"  - License: {loaded_skill.license}")
+    print(f"  - Compatibility: {loaded_skill.compatibility}")
+    print(f"  - Metadata: {loaded_skill.metadata}")
+    if loaded_skill.resources:
+        print("  - Resources:")
+        print(f"    - Scripts: {loaded_skill.resources.scripts}")
+        print(f"    - References: {loaded_skill.resources.references}")
+        print(f"    - Assets: {loaded_skill.resources.assets}")
+        print(f"    - Skill root: {loaded_skill.resources.skill_root}")
+
+# =========================================================================
+# Part 2: Using Skills with an Agent
+# =========================================================================
+print("\n" + "=" * 80)
+print("Part 2: Using Skills with an Agent")
+print("=" * 80)
+
+# Check for API key
+api_key = os.getenv("LLM_API_KEY")
+if not api_key:
+    print("Skipping agent demo (LLM_API_KEY not set)")
+    print("\nTo run the full demo, set the LLM_API_KEY environment variable:")
+    print("  export LLM_API_KEY=your-api-key")
+    sys.exit(0)
+
+# Configure LLM
+model = os.getenv("LLM_MODEL", "anthropic/claude-sonnet-4-5-20250929")
+llm = LLM(
+    usage_id="skills-demo",
+    model=model,
+    api_key=SecretStr(api_key),
+    base_url=os.getenv("LLM_BASE_URL"),
+)
+
+# Create agent context with loaded skills
+agent_context = AgentContext(
+    skills=list(agent_skills.values()),
+    # Disable public skills for this demo to keep output focused
+    load_public_skills=False,
+)
+
+# Create agent with tools so it can read skill resources
+tools = [
+    Tool(name=TerminalTool.name),
+    Tool(name=FileEditorTool.name),
+]
+agent = Agent(llm=llm, tools=tools, agent_context=agent_context)
+
+# Create conversation
+conversation = Conversation(agent=agent, workspace=os.getcwd())
+
+# Test the skill (triggered by "encrypt" keyword)
+# The skill provides instructions and a script for ROT13 encryption
+print("\nSending message with 'encrypt' keyword to trigger skill...")
+conversation.send_message("Encrypt the message 'hello world'.")
+conversation.run()
+
+print(f"\nTotal cost: ${llm.metrics.accumulated_cost:.4f}")
+print(f"EXAMPLE_COST: {llm.metrics.accumulated_cost:.4f}")
+```
+
+You can run the example code as-is.
+
+<Note>
+  The model name should follow the [LiteLLM convention](https://models.litellm.ai/): `provider/model_name` (e.g., `anthropic/claude-sonnet-4-5-20250929`, `openai/gpt-4o`).
+  The `LLM_API_KEY` should be the API key for your chosen provider.
+</Note>
+
+<CodeGroup>
+  <CodeBlock language="bash" filename="Bring-your-own provider key" icon="terminal" wrap>
+    {`export LLM_API_KEY="your-api-key"\nexport LLM_MODEL="anthropic/claude-sonnet-4-5-20250929"  # or openai/gpt-4o, etc.\ncd software-agent-sdk\nuv run python ${path_to_script_3}`}
+  </CodeBlock>
+
+  <CodeBlock language="bash" filename="OpenHands Cloud" icon="terminal" wrap>
+    {`# https://app.all-hands.dev/settings/api-keys\nexport LLM_API_KEY="your-openhands-api-key"\nexport LLM_MODEL="openhands/claude-sonnet-4-5-20250929"\ncd software-agent-sdk\nuv run python ${path_to_script_3}`}
+  </CodeBlock>
+</CodeGroup>
+
+<Tip>
+  **ChatGPT Plus/Pro subscribers**: You can use `LLM.subscription_login()` to authenticate with your ChatGPT account and access Codex models without consuming API credits. See the [LLM Subscriptions guide](/sdk/guides/llm-subscriptions) for details.
+</Tip>
+
+### Key Functions
+
+#### `load_skills_from_dir()`
+
+Loads all skills from a directory, returning three dictionaries:
+
+```python icon="python" focus={3} theme={null}
+from openhands.sdk.context.skills import load_skills_from_dir
+
+repo_skills, knowledge_skills, agent_skills = load_skills_from_dir(skills_dir)
+```
+
+* **repo\_skills**: Skills from `repo.md` files (always active)
+* **knowledge\_skills**: Skills from `knowledge/` subdirectories
+* **agent\_skills**: Skills from `SKILL.md` files (AgentSkills standard)
+
+#### `discover_skill_resources()`
+
+Discovers resource files in a skill directory:
+
+```python icon="python" focus={3} theme={null}
+from openhands.sdk.context.skills import discover_skill_resources
+
+resources = discover_skill_resources(skill_dir)
+print(resources.scripts)     # List of script files
+print(resources.references)  # List of reference files
+print(resources.assets)      # List of asset files
+print(resources.skill_root)  # Path to skill directory
+```
+
+### Skill Location in Prompts
+
+The `<location>` element in `<available_skills>` follows the AgentSkills standard, allowing agents to read the full skill content on demand. When a triggered skill is activated, the content is injected with the location path:
+
+```
+<EXTRA_INFO>
+The following information has been included based on a keyword match for "encrypt".
+
+Skill location: /path/to/rot13-encryption
+(Use this path to resolve relative file references in the skill content below)
+
+[skill content from SKILL.md]
+</EXTRA_INFO>
+```
+
+This enables skills to reference their own scripts and resources using relative paths like `./scripts/encrypt.sh`.
+
+### Example Skill: ROT13 Encryption
+
+Here's a skill with triggers (OpenHands extension):
+
+**SKILL.md:**
+
+```markdown icon="markdown" theme={null}
+---
+name: rot13-encryption
+description: >
+  This skill helps encrypt and decrypt messages using ROT13 cipher.
+triggers:
+  - encrypt
+  - decrypt
+  - cipher
+---
+
+# ROT13 Encryption Skill
+
+Run the [encrypt.sh](scripts/encrypt.sh) script with your message:
+
+\`\`\`bash
+./scripts/encrypt.sh "your message"
+\`\`\`
+```
+
+**scripts/encrypt.sh:**
+
+```bash icon="sh" theme={null}
+#!/bin/bash
+echo "$1" | tr 'A-Za-z' 'N-ZA-Mn-za-m'
+```
+
+When the user says "encrypt", the skill is triggered and the agent can use the provided script.
+
+## Loading Public Skills
+
+OpenHands maintains a [public skills repository](https://github.com/OpenHands/extensions) with community-contributed skills. You can automatically load these skills without waiting for SDK updates.
+
+### Automatic Loading via AgentContext
+
+Enable public skills loading in your `AgentContext`:
+
+```python icon="python" focus={2} theme={null}
+agent_context = AgentContext(
+    load_public_skills=True,  # Auto-load from public registry
+    skills=[
+        # Your custom skills here
+    ]
+)
+```
+
+When enabled, the SDK will:
+
+1. Clone or update the public skills repository to `~/.openhands/cache/skills/` on first run
+2. Load all available skills from the repository
+3. Merge them with your explicitly defined skills
+
+### Skill Naming and Triggers
+
+**Skill Precedence by Name**: If a skill name conflicts, your explicitly defined skills take precedence over public skills. For example, if you define a skill named `code-review`, the public `code-review` skill will be skipped entirely.
+
+**Multiple Skills with Same Trigger**: Skills with different names but the same trigger can coexist and will ALL be activated when the trigger matches. To add project-specific guidelines alongside public skills, use a unique name (e.g., `custom-codereview-guide` instead of `code-review`). Both skills will be triggered together.
+
+```python icon="python" theme={null}
+# Both skills will be triggered by "/codereview"
+agent_context = AgentContext(
+    load_public_skills=True,  # Loads public "code-review" skill
+    skills=[
+        Skill(
+            name="custom-codereview-guide",  # Different name = coexists
+            content="Project-specific guidelines...",
+            trigger=KeywordTrigger(keywords=["/codereview"]),
+        ),
+    ]
+)
+```
+
+<Tip>
+  **Skill Activation Behavior**: When multiple skills share a trigger, all matching skills are loaded. Content is concatenated into the agent's context with public skills first, then explicitly defined skills. There is no smart merging—if guidelines conflict, the agent sees both.
+</Tip>
+
+### Programmatic Loading
+
+You can also load public skills manually and have more control:
+
+```python icon="python" theme={null}
+from openhands.sdk.context.skills import load_public_skills
+
+# Load all public skills
+public_skills = load_public_skills()
+
+# Use with AgentContext
+agent_context = AgentContext(skills=public_skills)
+
+# Or combine with custom skills
+my_skills = [
+    Skill(name="custom", content="Custom instructions", trigger=None)
+]
+agent_context = AgentContext(skills=my_skills + public_skills)
+```
+
+### Custom Skills Repository
+
+You can load skills from your own repository:
+
+```python icon="python" focus={3-7} theme={null}
+from openhands.sdk.context.skills import load_public_skills
+
+# Load from a custom repository
+custom_skills = load_public_skills(
+    repo_url="https://github.com/my-org/my-skills",
+    branch="main"
+)
+```
+
+### How It Works
+
+The `load_public_skills()` function uses git-based caching for efficiency:
+
+* **First run**: Clones the skills repository to `~/.openhands/cache/skills/public-skills/`
+* **Subsequent runs**: Pulls the latest changes to keep skills up-to-date
+* **Offline mode**: Uses the cached version if network is unavailable
+
+This approach is more efficient than fetching individual skill files via HTTP and ensures you always have access to the latest community skills.
+
+<Note>
+  Explore available public skills at [github.com/OpenHands/extensions](https://github.com/OpenHands/extensions). These skills cover various domains like GitHub integration, Python development, debugging, and more.
+</Note>
+
+## Customizing Agent Context
+
+### Message Suffixes
+
+Append custom instructions to the system prompt or user messages via `AgentContext`:
+
+```python icon="python" theme={null}
+agent_context = AgentContext(
+    system_message_suffix="""
+<REPOSITORY_INFO>
+Repository: my-project
+Branch: feature/new-api
+</REPOSITORY_INFO>
+    """.strip(),
+    user_message_suffix="Remember to explain your reasoning."
+)
+```
+
+* **`system_message_suffix`**: Appended to system prompt (always active, combined with repo skills)
+* **`user_message_suffix`**: Appended to each user message
+
+### Replacing the Entire System Prompt
+
+For complete control, provide a custom Jinja2 template via the `Agent` class:
+
+```python icon="python" focus={6} theme={null}
+from openhands.sdk import Agent
+
+agent = Agent(
+    llm=llm,
+    tools=tools,
+    system_prompt_filename="/path/to/custom_system_prompt.j2",  # Absolute path
+    system_prompt_kwargs={"cli_mode": True, "repo_name": "my-project"}
+)
+```
+
+**Custom template example** (`custom_system_prompt.j2`):
+
+```jinja2  theme={null}
+You are a helpful coding assistant for {{ repo_name }}.
+
+{% if cli_mode %}
+You are running in CLI mode. Keep responses concise.
+{% endif %}
+
+Follow these guidelines:
+- Write clean, well-documented code
+- Consider edge cases and error handling
+- Suggest tests when appropriate
+```
+
+**Key points:**
+
+* Use relative filenames (e.g., `"system_prompt.j2"`) to load from the agent's prompts directory
+* Use absolute paths (e.g., `"/path/to/prompt.j2"`) to load from any location
+* Pass variables to the template via `system_prompt_kwargs`
+* The `system_message_suffix` from `AgentContext` is automatically appended after your custom prompt
+
+## Next Steps
+
+* **[Custom Tools](/sdk/guides/custom-tools)** - Create specialized tools
+* **[MCP Integration](/sdk/guides/mcp)** - Connect external tool servers
+* **[Confirmation Mode](/sdk/guides/security)** - Add execution approval
+
